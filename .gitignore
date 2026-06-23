@@ -1,0 +1,41 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local editor/OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+tmp/
+temp/
+
+# Source evidence and local databases
+source_data/
+communications.sqlite
+*.sqlite
+*.sqlite3
+*.db
+extracted_attachments/
+
+# Generated attorney review bundle output
+attorney_bundle/
+
+# AI/cache exports generated inside the bundle or during local runs
+cache.sqlite
+message_tags.json
+candidate_sets.json
