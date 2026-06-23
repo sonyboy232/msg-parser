@@ -19,6 +19,7 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -553,6 +554,34 @@ def append_image_page(
     return page
 
 
+def rasterize_pdf_pages(pdf_path: Path, output_dir: Path, stem: str) -> list[Path]:
+    ghostscript = shutil.which("gs")
+    if not ghostscript:
+        raise RuntimeError("Ghostscript (gs) is required to rasterize PDF attachments into exhibit pages.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = output_dir / f"{stem}_%03d.jpg"
+    command = [
+        ghostscript,
+        "-dSAFER",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-sDEVICE=jpeg",
+        "-dJPEGQ=90",
+        "-r144",
+        f"-sOutputFile={output_pattern}",
+        str(pdf_path),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip() or f"exit status {exc.returncode}"
+        raise RuntimeError(f"Ghostscript rasterization failed: {detail}") from exc
+    rendered = sorted(output_dir.glob(f"{stem}_*.jpg"))
+    if not rendered:
+        raise RuntimeError("Ghostscript rasterization finished without producing any JPEG pages.")
+    return rendered
+
+
 def build_exhibit_pdfs(
     output_dir: Path,
     messages: list[dict[str, Any]],
@@ -561,6 +590,8 @@ def build_exhibit_pdfs(
     PdfReader, PdfWriter, canvas_module, pagesize, image_tools = require_pdf_libraries()
     exhibits_dir = output_dir / "exhibits"
     exhibits_dir.mkdir(parents=True, exist_ok=True)
+    rendered_pages_dir = exhibits_dir / "rendered_pages"
+    rendered_pages_dir.mkdir(parents=True, exist_ok=True)
     exhibit_manifest_path = exhibits_dir / "exhibit_manifest.json"
     previous_exhibit_manifest: dict[str, dict[str, str]] = {}
     if exhibit_manifest_path.exists():
@@ -609,11 +640,15 @@ def build_exhibit_pdfs(
 
         try:
             previous_row = previous_exhibit_manifest.get(str(attachment.get("attachment_id") or ""), {})
-            if output_path.exists() and (
-                not source_path.exists() or output_path.stat().st_mtime >= source_path.stat().st_mtime
-            ):
+            cached_status = str(previous_row.get("exhibit_status") or "")
+            needs_pdf_raster_refresh = kind == "pdf" and "pdf_images" not in cached_status
+            can_reuse_output = (
+                output_path.exists()
+                and not needs_pdf_raster_refresh
+                and (not source_path.exists() or output_path.stat().st_mtime >= source_path.stat().st_mtime)
+            )
+            if can_reuse_output:
                 attachment["exhibit_pdf_path"] = relative_path
-                cached_status = previous_row.get("exhibit_status") or ""
                 attachment["exhibit_status"] = (
                     f"cached_{kind}_exhibit" if cached_status == "cached" else cached_status or f"cached_{kind}_exhibit"
                 )
@@ -644,19 +679,18 @@ def build_exhibit_pdfs(
 
             cover = make_cover_pdf(attachment, message, canvas_module, pagesize, warning)
             append_pdf_pages(writer, PdfReader(cover))
+            attachment["exhibit_warning"] = ""
 
             if source_path.exists() and kind == "pdf":
                 try:
-                    source_reader = PdfReader(str(source_path))
-                    if getattr(source_reader, "is_encrypted", False):
-                        try:
-                            source_reader.decrypt("")
-                        except Exception as exc:  # pragma: no cover - depends on source PDFs
-                            raise ValueError(f"PDF is encrypted and could not be opened: {exc}") from exc
-                    append_pdf_pages(writer, source_reader)
-                    attachment["exhibit_status"] = "cover_plus_pdf"
+                    page_stem = safe_artifact_name(str(attachment.get("attachment_id") or exhibit_id), str(exhibit_id))
+                    rendered_pages = rasterize_pdf_pages(source_path, rendered_pages_dir, page_stem)
+                    for page_path in rendered_pages:
+                        image_page = append_image_page(writer, page_path, canvas_module, pagesize, image_tools)
+                        append_pdf_pages(writer, PdfReader(image_page))
+                    attachment["exhibit_status"] = "cover_plus_pdf_images"
                 except Exception as exc:
-                    warning = f"Original PDF could not be embedded; cover page generated only. {exc}"
+                    warning = f"Original PDF could not be rasterized into exhibit pages; cover page generated only. {exc}"
                     attachment["exhibit_status"] = "cover_only_pdf_error"
             elif source_path.exists() and kind == "image":
                 try:
@@ -876,6 +910,7 @@ def render_index(
     integrity: dict[str, Any],
     exhibit_summary: dict[str, Any],
     ai_triage: dict[str, Any],
+    manifest: dict[str, Any],
 ) -> str:
     payload = json.dumps(
         {
@@ -884,6 +919,7 @@ def render_index(
             "timeline": timeline_rows,
             "integrity": integrity,
             "exhibits": exhibit_summary,
+            "manifest": manifest,
             "ai": {
                 "available": bool(ai_triage.get("available")),
                 "tag_options": ai_triage.get("tag_options", []),
@@ -1526,6 +1562,7 @@ def render_index(
     const timeline = data.timeline;
     const integrity = data.integrity;
     const exhibits = data.exhibits || {};
+    const manifest = data.manifest || {};
     const ai = data.ai || {};
     const CONVERSATION_ATTACHMENT_WINDOW_HOURS = 24;
     const CONVERSATION_ATTACHMENT_LIMIT = 12;
@@ -1695,6 +1732,21 @@ def render_index(
       if (!messageMatchesControls(message)) return false;
       if (query && !messageQueryText(message).includes(query)) return false;
       return true;
+    }
+    function activeFilterCount() {
+      return [
+        els.source.value,
+        els.direction.value,
+        els.attachment.value,
+        els.start.value,
+        els.end.value,
+        els.aiTag.value,
+      ].filter(Boolean).length;
+    }
+    function updateFilterToggle() {
+      const count = activeFilterCount();
+      const label = els.advanced.hidden ? 'Add filter' : 'Hide filters';
+      els.toggleFilters.textContent = count ? `${label} (${count})` : label;
     }
     function filteredMessages() {
       const query = els.search.value.trim().toLowerCase();
@@ -2016,6 +2068,27 @@ def render_index(
       if (!href) return detailRow(label, '');
       return `<div class="key">${escapeHtml(label)}</div><div class="value"><a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(text || href)}</a></div>`;
     }
+    function bundleSummaryHtml() {
+      const warningCount = Number(manifest.exhibit_generation_warning_count || 0);
+      const sourceDbName = String(manifest.source_db_path || '').split('/').pop();
+      return `
+        <details>
+          <summary>Bundle Summary</summary>
+          <div class="detail-grid">
+            ${detailRow('bundle built', formatDateTime(manifest.build_timestamp_utc))}
+            ${detailRow('integrity status', manifest.integrity_status || integrity.status)}
+            ${detailRow('messages', manifest.message_count || messages.length)}
+            ${detailRow('attachments', manifest.attachment_count || attachments.length)}
+            ${detailRow('timeline rows', manifest.timeline_row_count || timeline.length)}
+            ${detailRow('source database', sourceDbName)}
+            ${detailRow('source db SHA-256', manifest.source_db_sha256)}
+            ${detailRow('generated exhibits', manifest.generated_exhibit_pdf_count)}
+            ${detailRow('reused exhibits', manifest.reused_exhibit_pdf_count)}
+            ${detailRow('exhibit warnings', warningCount)}
+            ${linkRow('full packet PDF', manifest.attachment_packet_pdf_path, manifest.attachment_packet_pdf_path)}
+          </div>
+        </details>`;
+    }
     function attachmentLinks(att) {
       return `
         <div class="row-actions">
@@ -2072,7 +2145,7 @@ def render_index(
       return `
         @page { margin: 0.75in; }
         html, body { max-width: 100%; overflow-x: hidden; }
-        body { color: #111; font: 12px/1.42 Georgia, "Times New Roman", serif; }
+        body { color: #111; font: 12px/1.42 Georgia, "Times New Roman", serif; max-width: 8.75in; margin: 0 auto; }
         h1 { font: 700 20px/1.2 Arial, sans-serif; margin: 0 0 8px; }
         h2 { font: 700 15px/1.25 Arial, sans-serif; margin: 18px 0 8px; border-bottom: 1px solid #999; padding-bottom: 3px; }
         h3 { font: 700 13px/1.25 Arial, sans-serif; margin: 12px 0 6px; }
@@ -2093,6 +2166,9 @@ def render_index(
         .summary-table th { font: 700 11px/1.25 Arial, sans-serif; background: #eee; text-align: left; }
         .summary-table td { font-size: 11px; }
         .summary-body { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+        .exhibit-reference { border-left: 3px solid #777; padding-left: 8px; margin: 10px 0; font: 11px/1.4 Arial, sans-serif; color: #333; }
+        .attachment-page { break-before: page; page-break-before: always; page-break-inside: avoid; }
+        .attachment-page:first-of-type { break-before: auto; page-break-before: auto; }
         body.timeline-print { font-size: 10.5px; }
         body.timeline-print h1 { font-size: 18px; }
         body.timeline-print .meta { font-size: 10px; }
@@ -2132,6 +2208,13 @@ def render_index(
       const imageHtml = isPrintableImage(att) && att.preferred_view_path
         ? `<img class="exhibit-image" src="${escapeHtml(att.preferred_view_path)}" alt="${escapeHtml(att.filename || att.attachment_id || 'Attachment image')}">`
         : '';
+      const exhibitReference = att.exhibit_id || att.attachment_id || 'attachment exhibit';
+      const exhibitReferenceHtml = att.exhibit_pdf_path
+        ? `<p class="exhibit-reference">See exhibit ${escapeHtml(exhibitReference)} in the full packet appendix PDF.</p>`
+        : `<p class="exhibit-reference">Exhibit rendering is unavailable for this attachment in the appendix packet.</p>`;
+      const bodyContent = attachmentKind(att) === 'pdf' && level !== 'full'
+        ? exhibitReferenceHtml
+        : (imageHtml || exhibitReferenceHtml);
       const fullRows = level === 'full' ? `
             ${printDetailRow('exhibit PDF', att.exhibit_pdf_path)}
             ${printDetailRow('saved path', att.saved_path)}
@@ -2140,10 +2223,10 @@ def render_index(
             ${printDetailRow('EXIF raw', att.exif_dt_raw)}
       ` : '';
       return `
-        <div class="attachment">
+        <div class="attachment attachment-page">
           <h3>${escapeHtml(label || 'Attachment')} ${escapeHtml(att.exhibit_id || att.attachment_id || '')}</h3>
           ${exhibitCoverHtml(att, sourceMessage)}
-          ${imageHtml}
+          ${bodyContent}
           <div class="grid">
             ${printDetailRow('exhibit_id', att.exhibit_id)}
             ${printDetailRow('attachment_id', att.attachment_id)}
@@ -2202,28 +2285,82 @@ def render_index(
       const direct = (message.attachments || []).map(att => `${att.exhibit_id || ''} ${att.attachment_id} ${kindLabel(attachmentKind(att))} ${att.filename || att.saved_path || ''}`.trim());
       return direct.length ? direct.join('\\n') : '';
     }
+    function printSummarySnippet(message) {
+      const subject = String(message.subject || '').trim();
+      const body = String(message.body_clean || '').replace(/\\s+/g, ' ').trim();
+      const base = body || subject || '[no body]';
+      return base.length > 220 ? `${base.slice(0, 217)}...` : base;
+    }
+    function printSummaryExhibitText(message) {
+      const exhibitIds = [...new Set((message.attachments || []).map(att => att.exhibit_id || att.attachment_id).filter(Boolean))];
+      return exhibitIds.length ? exhibitIds.join('\\n') : 'None';
+    }
     function printSummaryTable(messagesForPrint) {
       return `
         <table class="summary-table">
           <thead>
             <tr>
-              <th style="width:16%;">Date / Time</th>
-              <th style="width:10%;">Direction</th>
-              <th style="width:17%;">From</th>
-              <th style="width:17%;">To</th>
-              <th>Message</th>
-              <th style="width:17%;">Attachments</th>
+              <th style="width:18%;">Date</th>
+              <th style="width:20%;">Sender</th>
+              <th>Snippet</th>
+              <th style="width:20%;">Exhibit</th>
             </tr>
           </thead>
           <tbody>
             ${messagesForPrint.map(message => `
               <tr>
                 <td>${escapeHtml(formatDateTime(message.event_dt_utc))}<br>${escapeHtml(message.event_id)}</td>
-                <td>${escapeHtml(message.direction)}<br>${escapeHtml(message.source)}</td>
-                <td>${escapeHtml(message.display_sender || message.sender)}</td>
-                <td>${escapeHtml(message.display_recipients || (message.recipients || []).join(', '))}</td>
-                <td class="summary-body">${escapeHtml(message.body_clean || message.subject || '[no body]')}</td>
-                <td class="summary-body">${escapeHtml(printSummaryAttachmentText(message))}</td>
+                <td class="summary-body">${escapeHtml(message.display_sender || message.sender || '')}</td>
+                <td class="summary-body">${escapeHtml(printSummarySnippet(message))}</td>
+                <td class="summary-body">${escapeHtml(printSummaryExhibitText(message))}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>`;
+    }
+    function printSummaryAppendix(messagesForPrint) {
+      const rows = messagesForPrint
+        .filter(message => (message.attachments || []).length)
+        .map(message => `
+          <tr>
+            <td>${escapeHtml(formatDateTime(message.event_dt_utc))}<br>${escapeHtml(message.event_id)}</td>
+            <td class="summary-body">${escapeHtml(printSummaryAttachmentText(message))}</td>
+          </tr>`)
+        .join('');
+      if (!rows) return '';
+      return `
+        <h2>Attachment Appendix</h2>
+        <table class="summary-table">
+          <thead>
+            <tr>
+              <th style="width:24%;">Record</th>
+              <th>Attachment References</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+    function printAttachmentSummaryTable(rows) {
+      return `
+        <table class="summary-table">
+          <thead>
+            <tr>
+              <th style="width:18%;">Date</th>
+              <th style="width:18%;">Sender</th>
+              <th>Attachment</th>
+              <th style="width:20%;">Exhibit</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(({ message, attachment }) => `
+              <tr>
+                <td>${escapeHtml(formatDateTime(message.event_dt_utc))}<br>${escapeHtml(attachment.event_id || '')}</td>
+                <td class="summary-body">${escapeHtml(message.display_sender || message.sender || '')}</td>
+                <td class="summary-body">${escapeHtml([
+                  attachment.filename || attachment.saved_path || '[unnamed attachment]',
+                  attachment.attachment_id,
+                  kindLabel(attachmentKind(attachment)),
+                ].filter(Boolean).join('\\n'))}</td>
+                <td class="summary-body">${escapeHtml(attachment.exhibit_id || attachment.attachment_id || '')}</td>
               </tr>`).join('')}
           </tbody>
         </table>`;
@@ -2376,10 +2513,32 @@ def render_index(
       `);
     }
     function printSummaryResults() {
-      const previous = els.printLevel.value;
-      els.printLevel.value = 'summary';
-      printCurrentResults();
-      els.printLevel.value = previous;
+      if (activeView === 'attachments') {
+        const rows = filteredAttachmentEntries();
+        openPrintDocument('Attorney Review Attachment Summary', `
+          <h1>Attorney Review Exhibit - Attachment Summary</h1>
+          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: summary</p>
+          <p class="meta">${escapeHtml(activeFilterSummary())}</p>
+          <p class="meta">${rows.length} attachments from ${filteredMessages().length} filtered messages</p>
+          ${rows.length ? printAttachmentSummaryTable(rows) : '<p>No attachments match the current filters.</p>'}
+        `);
+        return;
+      }
+      const rows = filteredMessages()
+        .slice()
+        .sort((a, b) => String(a.event_dt_utc || '').localeCompare(String(b.event_dt_utc || '')) || String(a.event_id || '').localeCompare(String(b.event_id || '')));
+      const title = activeView === 'timeline'
+        ? 'Attorney Review Exhibit - Timeline Summary'
+        : 'Attorney Review Exhibit - Search Summary';
+      const summaryLabel = activeView === 'timeline' ? 'filtered timeline messages' : 'filtered messages';
+      openPrintDocument('Attorney Review Summary', `
+        <h1>${escapeHtml(title)}</h1>
+        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: summary</p>
+        <p class="meta">${escapeHtml(activeFilterSummary())}</p>
+        <p class="meta">${rows.length} ${escapeHtml(summaryLabel)}</p>
+        ${rows.length ? printSummaryTable(rows) : '<p>No messages match the current filters.</p>'}
+        ${rows.length ? printSummaryAppendix(rows) : ''}
+      `);
     }
     function filteredMessageAttachments() {
       const seen = new Set();
@@ -2468,6 +2627,7 @@ def render_index(
       els.detail.innerHTML = `
         <h2>${escapeHtml(att.attachment_id)} Attachment</h2>
         <p><button id="printDetail" type="button">Print Detail</button></p>
+        ${bundleSummaryHtml()}
         <div class="detail-grid">
           ${detailRow('attachment_id', att.attachment_id)}
           ${detailRow('exhibit_id', att.exhibit_id)}
@@ -2482,7 +2642,7 @@ def render_index(
         ${exhibitCoverHtml(att, message)}
         ${attachmentPreviewHtml(att)}
         <details>
-          <summary>Attachment Metadata</summary>
+          <summary>Metadata</summary>
           <div class="detail-grid">
             ${detailRow('source file path', att.source_file)}
             ${detailRow('exhibit_id', att.exhibit_id)}
@@ -2495,18 +2655,13 @@ def render_index(
             ${detailRow('size_bytes', att.size_bytes)}
             ${detailRow('sha256_hash', att.sha256_hash)}
             ${detailRow('EXIF raw', att.exif_dt_raw)}
-          </div>
-        </details>
-        <details>
-          <summary>Linked Message Metadata</summary>
-          <div class="detail-grid">
-            ${detailRow('event_id', message.event_id)}
-            ${detailRow('timestamp', formatDateTime(message.event_dt_utc))}
-            ${detailRow('source', message.source)}
-            ${detailRow('direction', message.direction)}
-            ${detailRow('sender', message.sender)}
-            ${detailRow('recipients', (message.recipients || []).join(', '))}
-            ${detailRow('subject', message.subject)}
+            ${detailRow('linked message event_id', message.event_id)}
+            ${detailRow('linked message timestamp', formatDateTime(message.event_dt_utc))}
+            ${detailRow('linked message source', message.source)}
+            ${detailRow('linked message direction', message.direction)}
+            ${detailRow('linked message sender', message.sender)}
+            ${detailRow('linked message recipients', (message.recipients || []).join(', '))}
+            ${detailRow('linked message subject', message.subject)}
           </div>
         </details>
       `;
@@ -2558,6 +2713,7 @@ def render_index(
       els.detail.innerHTML = `
         <h2>${escapeHtml(message.event_id)} Detail</h2>
         <p><button id="printDetail" type="button">Print Detail</button></p>
+        ${bundleSummaryHtml()}
         <div class="detail-grid">
           ${detailRow('event_id', message.event_id)}
           ${detailRow('timestamp', formatDateTime(message.event_dt_utc))}
@@ -2587,7 +2743,7 @@ def render_index(
           </div>
         </details>
         <details>
-          <summary>Record Metadata</summary>
+          <summary>Metadata</summary>
           <div class="detail-grid">
             ${detailRow('source_record_id', message.source_record_id)}
             ${detailRow('thread_key', message.thread_key)}
@@ -2595,6 +2751,7 @@ def render_index(
           </div>
         </details>
         ${threadContextHtml(message)}
+        ${(message.attachments || []).length ? `
         <details>
           <summary>Attachment Metadata</summary>
           ${(message.attachments || []).map(att => `
@@ -2615,8 +2772,8 @@ def render_index(
                 ${detailRow('EXIF raw', att.exif_dt_raw)}
                 ${detailRow('EXIF UTC', formatDateTime(att.exif_dt_utc))}
               </div>
-            </div>`).join('') || '<p>No linked attachments.</p>'}
-        </details>
+            </div>`).join('')}
+        </details>` : ''}
       `;
       document.getElementById('copyCitation').addEventListener('click', copyCitation);
       document.getElementById('printDetail').addEventListener('click', printSelectedDetail);
@@ -2630,13 +2787,14 @@ def render_index(
       els.messagesTab.setAttribute('aria-selected', activeView === 'messages' ? 'true' : 'false');
       els.timelineTab.setAttribute('aria-selected', activeView === 'timeline' ? 'true' : 'false');
       els.attachmentsTab.setAttribute('aria-selected', activeView === 'attachments' ? 'true' : 'false');
+      updateFilterToggle();
       renderList();
       renderDetail();
     }
     [els.search, els.source, els.direction, els.attachment, els.start, els.end, els.aiTag].forEach(el => el.addEventListener('input', render));
     els.toggleFilters.addEventListener('click', () => {
       els.advanced.hidden = !els.advanced.hidden;
-      els.toggleFilters.textContent = els.advanced.hidden ? 'Add filter' : 'Hide filters';
+      updateFilterToggle();
     });
     els.clearFilters.addEventListener('click', () => {
       els.search.value = '';
@@ -2755,7 +2913,15 @@ def main() -> None:
     write_json(output_dir / "data" / "integrity_report.json", integrity)
     write_json(output_dir / "data" / "bundle_manifest.json", manifest)
     (output_dir / "index.html").write_text(
-        render_index(message_exports, attachment_exports, timeline_rows, integrity, exhibit_summary, ai_triage),
+        render_index(
+            message_exports,
+            attachment_exports,
+            timeline_rows,
+            integrity,
+            exhibit_summary,
+            ai_triage,
+            manifest,
+        ),
         encoding="utf-8",
     )
     write_readme(output_dir / "README_FOR_ATTORNEY.txt", integrity)
