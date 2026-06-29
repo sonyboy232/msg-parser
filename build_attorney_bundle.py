@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
-import io
 import json
 import re
 import shutil
@@ -87,9 +86,9 @@ ATTACHMENT_DERIVED_FIELDS = [
     "bundle_converted_path",
     "preferred_view_path",
     "exhibit_id",
-    "exhibit_pdf_path",
-    "exhibit_status",
-    "exhibit_warning",
+    "rendered_page_paths",
+    "render_asset_status",
+    "render_asset_warning",
 ]
 
 
@@ -263,16 +262,39 @@ def build_exports(
         attachment["preferred_view_path"] = converted_href or original_href
         attachment_number = str(attachment.get("attachment_id", "")).replace("A-", "", 1)
         attachment["exhibit_id"] = f"EX-{attachment_number}" if attachment_number else ""
-        attachment["exhibit_pdf_path"] = ""
-        attachment["exhibit_status"] = ""
-        attachment["exhibit_warning"] = ""
+        attachment["rendered_page_paths"] = []
+        attachment["render_asset_status"] = ""
+        attachment["render_asset_warning"] = ""
         by_event[attachment["event_id"]].append(attachment)
 
     message_exports: list[dict[str, Any]] = []
     for message in messages:
         msg_attachments = by_event.get(message["event_id"], [])
         body = str(message.get("body_clean", "") or "").strip()
-        body_preview = compact_text(body or "[no message body]", 180)
+        image_attachments = [
+            attachment
+            for attachment in msg_attachments
+            if attachment_kind(attachment) == "image"
+            and str(attachment.get("preferred_view_path") or attachment.get("bundle_saved_path") or "").strip()
+            and not re.search(
+                r"\.heics?$",
+                str(
+                    attachment.get("preferred_view_path")
+                    or attachment.get("bundle_saved_path")
+                    or attachment.get("saved_path")
+                    or ""
+                ).lower(),
+            )
+        ]
+        first_image_attachment = image_attachments[0] if image_attachments else None
+        body_preview = compact_text(
+            body or (
+                f"{len(msg_attachments)} attachment{'s' if len(msg_attachments) != 1 else ''}"
+                if msg_attachments
+                else "[no message body]"
+            ),
+            180,
+        )
         recipients = decode_recipients(str(message.get("recipients_json", "")))
         display_sender = display_person(message.get("sender"))
         display_recipients = ", ".join(recipients) if recipients else ""
@@ -291,6 +313,16 @@ def build_exports(
         exported["body_preview"] = body_preview
         exported["is_attachment_only"] = bool(msg_attachments) and len(body) <= 12
         exported["has_exif_attachment"] = any(bool(att.get("exif_dt_utc")) for att in msg_attachments)
+        exported["inline_preview_path"] = (
+            first_image_attachment.get("preferred_view_path")
+            or first_image_attachment.get("bundle_saved_path")
+            if first_image_attachment
+            else ""
+        )
+        exported["inline_preview_attachment_id"] = (
+            first_image_attachment.get("attachment_id") if first_image_attachment else ""
+        )
+        exported["additional_inline_image_count"] = max(0, len(image_attachments) - 1)
         exported["display_sender"] = display_sender
         exported["display_recipients"] = display_recipients
         exported["display_summary"] = compact_text(summary_source, 220)
@@ -399,165 +431,10 @@ def court_datetime(value: Any) -> str:
     return eastern.strftime("%m/%d/%Y %I:%M:%S %p %Z").lstrip("0").replace("/0", "/")
 
 
-def require_pdf_libraries() -> tuple[Any, Any, Any, Any, Any]:
-    try:
-        from PIL import Image
-        from pypdf import PdfReader, PdfWriter
-        from reportlab.lib.pagesizes import letter
-        from reportlab.lib.utils import ImageReader
-        from reportlab.pdfgen import canvas
-    except ImportError as exc:
-        raise SystemExit(
-            "PDF exhibit generation requires pypdf, reportlab, and pillow. "
-            "Install them in the active environment, for example: "
-            "python -m pip install pypdf reportlab pillow"
-        ) from exc
-    return PdfReader, PdfWriter, canvas, letter, (Image, ImageReader)
-
-
-def wrap_reportlab_text(text: str, max_chars: int = 92) -> list[str]:
-    words = str(text or "").split()
-    lines: list[str] = []
-    current: list[str] = []
-    length = 0
-    for word in words:
-        next_length = length + len(word) + (1 if current else 0)
-        if current and next_length > max_chars:
-            lines.append(" ".join(current))
-            current = [word]
-            length = len(word)
-        else:
-            current.append(word)
-            length = next_length
-    if current:
-        lines.append(" ".join(current))
-    return lines or [""]
-
-
-def make_cover_pdf(
-    attachment: dict[str, Any],
-    message: dict[str, Any],
-    canvas_module: Any,
-    pagesize: tuple[float, float],
-    warning: str = "",
-) -> io.BytesIO:
-    buffer = io.BytesIO()
-    width, height = pagesize
-    pdf = canvas_module.Canvas(buffer, pagesize=pagesize)
-    pdf.setTitle(f"{attachment.get('exhibit_id') or attachment.get('attachment_id')} cover")
-
-    y = height - 72
-    pdf.setFont("Helvetica-Bold", 28)
-    pdf.drawCentredString(width / 2, y, str(attachment.get("exhibit_id") or "Attachment Exhibit"))
-    y -= 34
-    pdf.setFont("Helvetica-Bold", 15)
-    pdf.drawCentredString(width / 2, y, "ATTACHMENT EXHIBIT COVER PAGE")
-
-    y -= 42
-    pdf.setFont("Helvetica", 11)
-    rows = [
-        ("Attachment ID", attachment.get("attachment_id")),
-        ("Source event_id", attachment.get("event_id")),
-        ("Message timestamp", court_datetime(message.get("event_dt_utc"))),
-        ("Sender", message.get("sender")),
-        ("Recipients", ", ".join(message.get("recipients") or [])),
-        ("Filename", attachment.get("filename") or attachment.get("saved_path")),
-        ("MIME type", attachment.get("mime_type")),
-        ("Size", attachment.get("size_bytes")),
-        ("EXIF timestamp", court_datetime(attachment.get("exif_dt_utc"))),
-        ("SHA-256", attachment.get("sha256_hash")),
-    ]
-    for label, value in rows:
-        if y < 96:
-            pdf.showPage()
-            y = height - 72
-            pdf.setFont("Helvetica", 11)
-        pdf.setFont("Helvetica-Bold", 10)
-        pdf.drawString(72, y, f"{label}:")
-        pdf.setFont("Helvetica", 10)
-        line_x = 180
-        for index, line in enumerate(wrap_reportlab_text(str(value or ""))):
-            pdf.drawString(line_x, y - (index * 13), line)
-        y -= max(17, 13 * len(wrap_reportlab_text(str(value or ""))) + 4)
-
-    kind = attachment_kind(attachment).upper()
-    y -= 10
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawString(72, y, f"Attachment type: {kind}")
-    y -= 20
-
-    if warning:
-        pdf.setFillColorRGB(0.5, 0.13, 0.08)
-        pdf.setFont("Helvetica-Bold", 11)
-        pdf.drawString(72, y, "Generation note:")
-        y -= 15
-        pdf.setFont("Helvetica", 10)
-        for line in wrap_reportlab_text(warning):
-            pdf.drawString(72, y, line)
-            y -= 13
-        pdf.setFillColorRGB(0, 0, 0)
-
-    pdf.setFont("Helvetica", 9)
-    pdf.drawString(72, 45, "Generated from the offline attorney review bundle. Original file paths and hashes remain in the manifest.")
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
-    return buffer
-
-
-def append_pdf_pages(writer: Any, reader: Any) -> None:
-    for page in reader.pages:
-        writer.add_page(page)
-
-
-def append_image_page(
-    writer: Any,
-    image_path: Path,
-    canvas_module: Any,
-    pagesize: tuple[float, float],
-    image_tools: tuple[Any, Any],
-) -> io.BytesIO:
-    Image, ImageReader = image_tools
-    page = io.BytesIO()
-    width, height = pagesize
-    margin = 54
-    target_dpi = 200
-    with Image.open(image_path) as img:
-        if getattr(img, "n_frames", 1) > 1:
-            img.seek(0)
-        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-            img = img.convert("RGBA")
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[-1])
-            img = background
-        elif img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        max_pixels = (
-            int((width - margin * 2) / 72 * target_dpi),
-            int((height - margin * 2) / 72 * target_dpi),
-        )
-        img.thumbnail(max_pixels, Image.Resampling.LANCZOS)
-        img_width, img_height = img.size
-        scale = min((width - margin * 2) / img_width, (height - margin * 2) / img_height)
-        draw_width = img_width * scale
-        draw_height = img_height * scale
-        x = (width - draw_width) / 2
-        y = (height - draw_height) / 2
-        image_buffer = io.BytesIO()
-        img.save(image_buffer, format="JPEG", quality=88, optimize=True)
-        image_buffer.seek(0)
-        pdf = canvas_module.Canvas(page, pagesize=pagesize)
-        pdf.drawImage(ImageReader(image_buffer), x, y, width=draw_width, height=draw_height, preserveAspectRatio=True)
-        pdf.showPage()
-        pdf.save()
-    page.seek(0)
-    return page
-
-
 def rasterize_pdf_pages(pdf_path: Path, output_dir: Path, stem: str) -> list[Path]:
     ghostscript = shutil.which("gs")
     if not ghostscript:
-        raise RuntimeError("Ghostscript (gs) is required to rasterize PDF attachments into exhibit pages.")
+        raise RuntimeError("Ghostscript (gs) is required to rasterize PDF attachments into printable page images.")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_pattern = output_dir / f"{stem}_%03d.jpg"
     command = [
@@ -582,171 +459,85 @@ def rasterize_pdf_pages(pdf_path: Path, output_dir: Path, stem: str) -> list[Pat
     return rendered
 
 
-def build_exhibit_pdfs(
+def build_attachment_render_assets(
     output_dir: Path,
-    messages: list[dict[str, Any]],
     attachments: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    PdfReader, PdfWriter, canvas_module, pagesize, image_tools = require_pdf_libraries()
     exhibits_dir = output_dir / "exhibits"
-    exhibits_dir.mkdir(parents=True, exist_ok=True)
-    rendered_pages_dir = exhibits_dir / "rendered_pages"
-    rendered_pages_dir.mkdir(parents=True, exist_ok=True)
-    exhibit_manifest_path = exhibits_dir / "exhibit_manifest.json"
-    previous_exhibit_manifest: dict[str, dict[str, str]] = {}
-    if exhibit_manifest_path.exists():
-        try:
-            previous_data = json.loads(exhibit_manifest_path.read_text(encoding="utf-8"))
-            previous_exhibit_manifest = {
-                str(row.get("attachment_id") or ""): row
-                for row in previous_data.get("attachments", [])
-                if row.get("attachment_id")
-            }
-        except (json.JSONDecodeError, OSError):
-            previous_exhibit_manifest = {}
-    message_by_event = {message["event_id"]: message for message in messages}
+    if exhibits_dir.exists():
+        shutil.rmtree(exhibits_dir)
+
     warnings: list[dict[str, str]] = []
-    packet_writer = PdfWriter()
-    generated_count = 0
-    reused_count = 0
-    manifest_rows: list[dict[str, str]] = []
+    pdf_attachment_count = 0
+    rendered_pdf_attachment_count = 0
+    rendered_pdf_page_count = 0
+    inline_printable_attachment_count = 0
+    non_inline_printable_attachment_count = 0
 
-    sorted_attachments = sorted(
-        attachments,
-        key=lambda att: (
-            str(message_by_event.get(att.get("event_id"), {}).get("event_dt_utc") or ""),
-            str(att.get("attachment_id") or ""),
-        ),
-    )
-
-    for attachment in sorted_attachments:
-        message = message_by_event.get(attachment.get("event_id"), {})
-        exhibit_id = attachment.get("exhibit_id") or attachment.get("attachment_id") or "EX-UNKNOWN"
-        raw_filename = str(attachment.get("filename") or Path(str(attachment.get("saved_path") or "")).name or "")
-        filename_stem = Path(raw_filename).stem if raw_filename else "attachment"
-        output_name = safe_artifact_name(f"{exhibit_id}_{filename_stem}", str(exhibit_id)) + ".pdf"
-        output_path = exhibits_dir / output_name
-        relative_path = output_path.relative_to(output_dir).as_posix()
-        warning = ""
-        writer = PdfWriter()
+    for attachment in sorted(attachments, key=lambda att: (str(att.get("event_id") or ""), str(att.get("attachment_id") or ""))):
+        attachment["rendered_page_paths"] = []
+        attachment["render_asset_warning"] = ""
         kind = attachment_kind(attachment)
+        preferred_href = str(attachment.get("preferred_view_path") or attachment.get("bundle_saved_path") or "")
+        preferred_path = bundle_href_to_path(output_dir, preferred_href)
 
-        source_href = (
-            str(attachment.get("bundle_saved_path") or "")
-            if kind == "pdf"
-            else str(attachment.get("preferred_view_path") or attachment.get("bundle_saved_path") or "")
-        )
-        source_path = bundle_href_to_path(output_dir, source_href)
-
-        try:
-            previous_row = previous_exhibit_manifest.get(str(attachment.get("attachment_id") or ""), {})
-            cached_status = str(previous_row.get("exhibit_status") or "")
-            needs_pdf_raster_refresh = kind == "pdf" and "pdf_images" not in cached_status
-            can_reuse_output = (
-                output_path.exists()
-                and not needs_pdf_raster_refresh
-                and (not source_path.exists() or output_path.stat().st_mtime >= source_path.stat().st_mtime)
-            )
-            if can_reuse_output:
-                attachment["exhibit_pdf_path"] = relative_path
-                attachment["exhibit_status"] = (
-                    f"cached_{kind}_exhibit" if cached_status == "cached" else cached_status or f"cached_{kind}_exhibit"
+        if kind == "pdf":
+            pdf_attachment_count += 1
+            source_href = str(attachment.get("bundle_saved_path") or "")
+            source_path = bundle_href_to_path(output_dir, source_href)
+            if not source_href or not source_path.exists():
+                attachment["render_asset_status"] = "metadata_sheet_only"
+                attachment["render_asset_warning"] = (
+                    "Original PDF file is missing from the bundle, so browser print cannot embed its pages. "
+                    "Print this file separately from the original evidence source."
                 )
-                attachment["exhibit_warning"] = previous_row.get("exhibit_warning") or ""
-                if attachment["exhibit_warning"]:
-                    warnings.append(
-                        {
-                            "attachment_id": str(attachment.get("attachment_id") or ""),
-                            "warning": str(attachment["exhibit_warning"]),
-                        }
-                    )
-                exhibit_reader = PdfReader(str(output_path))
-                append_pdf_pages(packet_writer, exhibit_reader)
-                reused_count += 1
-                manifest_rows.append(
-                    {
-                        "attachment_id": str(attachment.get("attachment_id") or ""),
-                        "exhibit_id": str(attachment.get("exhibit_id") or ""),
-                        "exhibit_pdf_path": relative_path,
-                        "exhibit_status": str(attachment.get("exhibit_status") or ""),
-                        "exhibit_warning": str(attachment.get("exhibit_warning") or ""),
-                    }
-                )
+                warnings.append({"attachment_id": str(attachment.get("attachment_id") or ""), "warning": str(attachment["render_asset_warning"])})
+                non_inline_printable_attachment_count += 1
                 continue
+            try:
+                saved_parent = Path(str(attachment.get("saved_path") or "")).parent
+                rendered_pages_dir = output_dir / "attachments" / saved_parent / "pages"
+                rendered_pages_dir.mkdir(parents=True, exist_ok=True)
+                page_stem = safe_artifact_name(
+                    str(attachment.get("attachment_id") or attachment.get("exhibit_id") or "pdf"),
+                    str(attachment.get("exhibit_id") or attachment.get("attachment_id") or "pdf"),
+                )
+                rendered_pages = rasterize_pdf_pages(source_path, rendered_pages_dir, page_stem)
+                attachment["rendered_page_paths"] = [page_path.relative_to(output_dir).as_posix() for page_path in rendered_pages]
+                attachment["render_asset_status"] = "pdf_pages_rendered"
+                rendered_pdf_attachment_count += 1
+                rendered_pdf_page_count += len(rendered_pages)
+                inline_printable_attachment_count += 1
+            except Exception as exc:
+                attachment["render_asset_status"] = "metadata_sheet_only"
+                attachment["render_asset_warning"] = (
+                    "PDF pages could not be rasterized for browser print. "
+                    f"Print this file separately from the original PDF in the bundle. {exc}"
+                )
+                warnings.append({"attachment_id": str(attachment.get("attachment_id") or ""), "warning": str(attachment["render_asset_warning"])})
+                non_inline_printable_attachment_count += 1
+            continue
 
-            if not source_path.exists():
-                warning = f"Source attachment file was not found in the bundle: {source_href}"
+        if kind == "image" and preferred_href and preferred_path.exists() and not preferred_href.lower().endswith((".heic", ".heics")):
+            attachment["render_asset_status"] = "image_inline_ready"
+            inline_printable_attachment_count += 1
+            continue
 
-            cover = make_cover_pdf(attachment, message, canvas_module, pagesize, warning)
-            append_pdf_pages(writer, PdfReader(cover))
-            attachment["exhibit_warning"] = ""
-
-            if source_path.exists() and kind == "pdf":
-                try:
-                    page_stem = safe_artifact_name(str(attachment.get("attachment_id") or exhibit_id), str(exhibit_id))
-                    rendered_pages = rasterize_pdf_pages(source_path, rendered_pages_dir, page_stem)
-                    for page_path in rendered_pages:
-                        image_page = append_image_page(writer, page_path, canvas_module, pagesize, image_tools)
-                        append_pdf_pages(writer, PdfReader(image_page))
-                    attachment["exhibit_status"] = "cover_plus_pdf_images"
-                except Exception as exc:
-                    warning = f"Original PDF could not be rasterized into exhibit pages; cover page generated only. {exc}"
-                    attachment["exhibit_status"] = "cover_only_pdf_error"
-            elif source_path.exists() and kind == "image":
-                try:
-                    image_page = append_image_page(writer, source_path, canvas_module, pagesize, image_tools)
-                    append_pdf_pages(writer, PdfReader(image_page))
-                    attachment["exhibit_status"] = "cover_plus_image"
-                except Exception as exc:
-                    warning = f"Image could not be embedded; cover page generated only. {exc}"
-                    attachment["exhibit_status"] = "cover_only_image_error"
-            elif not attachment.get("exhibit_status"):
-                attachment["exhibit_status"] = "cover_only"
-
-            if warning and not attachment.get("exhibit_warning"):
-                attachment["exhibit_warning"] = warning
-                warnings.append({"attachment_id": str(attachment.get("attachment_id") or ""), "warning": warning})
-
-            with output_path.open("wb") as fh:
-                writer.write(fh)
-            attachment["exhibit_pdf_path"] = relative_path
-            generated_count += 1
-
-            exhibit_reader = PdfReader(str(output_path))
-            append_pdf_pages(packet_writer, exhibit_reader)
-            manifest_rows.append(
-                {
-                    "attachment_id": str(attachment.get("attachment_id") or ""),
-                    "exhibit_id": str(attachment.get("exhibit_id") or ""),
-                    "exhibit_pdf_path": relative_path,
-                    "exhibit_status": str(attachment.get("exhibit_status") or ""),
-                    "exhibit_warning": str(attachment.get("exhibit_warning") or ""),
-                }
-            )
-        except Exception as exc:
-            attachment["exhibit_status"] = "generation_failed"
-            attachment["exhibit_warning"] = str(exc)
-            warnings.append({"attachment_id": str(attachment.get("attachment_id") or ""), "warning": str(exc)})
-
-    packet_path = exhibits_dir / "attachment_packet.pdf"
-    with packet_path.open("wb") as fh:
-        packet_writer.write(fh)
-    write_json(
-        exhibit_manifest_path,
-        {
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "generated_count": generated_count,
-            "reused_count": reused_count,
-            "packet_path": packet_path.relative_to(output_dir).as_posix(),
-            "attachments": manifest_rows,
-        },
-    )
+        attachment["render_asset_status"] = "metadata_sheet_only"
+        attachment["render_asset_warning"] = (
+            "Browser print cannot embed this attachment type inline. "
+            "The original file remains in the offline bundle and may need separate manual printing or review."
+        )
+        non_inline_printable_attachment_count += 1
 
     return {
-        "generated_exhibit_pdf_count": generated_count,
-        "reused_exhibit_pdf_count": reused_count,
-        "attachment_packet_pdf_path": packet_path.relative_to(output_dir).as_posix(),
-        "exhibit_generation_warnings": warnings,
+        "pdf_attachment_count": pdf_attachment_count,
+        "rendered_pdf_attachment_count": rendered_pdf_attachment_count,
+        "rendered_pdf_page_count": rendered_pdf_page_count,
+        "inline_printable_attachment_count": inline_printable_attachment_count,
+        "non_inline_printable_attachment_count": non_inline_printable_attachment_count,
+        "render_asset_warnings": warnings,
+        "rendered_pages_location": "attachments/<event_id>/pages/*.jpg",
     }
 
 
@@ -765,7 +556,9 @@ def validate(
     message_ids = {message["event_id"] for message in messages}
     missing_saved_paths: list[dict[str, str]] = []
     missing_converted_paths: list[dict[str, str]] = []
-    missing_exhibit_pdf_paths: list[dict[str, str]] = []
+    missing_rendered_pdf_pages: list[dict[str, str]] = []
+    missing_inline_image_paths: list[dict[str, str]] = []
+    attachments_missing_render_status: list[dict[str, str]] = []
     attachment_event_mismatches: list[dict[str, str]] = []
     hash_mismatches: list[dict[str, str]] = []
     size_mismatches: list[dict[str, Any]] = []
@@ -808,10 +601,27 @@ def validate(
                 {"attachment_id": attachment["attachment_id"], "converted_path": converted_path}
             )
 
-        exhibit_pdf_path = str(attachment.get("exhibit_pdf_path") or "")
-        if not exhibit_pdf_path or not (bundle_dir / exhibit_pdf_path).exists():
-            missing_exhibit_pdf_paths.append(
-                {"attachment_id": attachment["attachment_id"], "exhibit_pdf_path": exhibit_pdf_path}
+        render_status = str(attachment.get("render_asset_status") or "")
+        if not render_status:
+            attachments_missing_render_status.append(
+                {"attachment_id": attachment["attachment_id"], "render_asset_status": render_status}
+            )
+
+        kind = attachment_kind(attachment)
+        if kind == "pdf" and not attachment.get("rendered_page_paths"):
+            missing_rendered_pdf_pages.append(
+                {"attachment_id": attachment["attachment_id"], "render_asset_status": render_status}
+            )
+
+        preferred_view_path = str(attachment.get("preferred_view_path") or "")
+        if (
+            kind == "image"
+            and preferred_view_path
+            and not preferred_view_path.lower().endswith((".heic", ".heics"))
+            and not (bundle_dir / preferred_view_path).exists()
+        ):
+            missing_inline_image_paths.append(
+                {"attachment_id": attachment["attachment_id"], "preferred_view_path": preferred_view_path}
             )
 
     timeline_sorted = timeline_rows == sorted(timeline_rows, key=timeline_sort_key)
@@ -839,7 +649,9 @@ def validate(
         "attachment_count_matches": len(attachments) == db_attachment_count,
         "all_saved_paths_exist_in_bundle": not missing_saved_paths,
         "all_converted_paths_exist_in_bundle": not missing_converted_paths,
-        "all_exhibit_pdfs_exist_in_bundle": not missing_exhibit_pdf_paths,
+        "all_pdf_pages_rendered_in_bundle": not missing_rendered_pdf_pages,
+        "all_inline_image_paths_exist_in_bundle": not missing_inline_image_paths,
+        "all_attachments_have_render_status": not attachments_missing_render_status,
         "all_attachments_map_to_existing_event_id": not attachment_event_mismatches,
         "timeline_rows_sorted": timeline_sorted,
         "timeline_source_labels_valid": not unexpected_timeline_labels,
@@ -864,7 +676,9 @@ def validate(
         "details": {
             "missing_saved_paths": missing_saved_paths,
             "missing_converted_paths": missing_converted_paths,
-            "missing_exhibit_pdf_paths": missing_exhibit_pdf_paths,
+            "missing_rendered_pdf_pages": missing_rendered_pdf_pages,
+            "missing_inline_image_paths": missing_inline_image_paths,
+            "attachments_missing_render_status": attachments_missing_render_status,
             "attachment_event_mismatches": attachment_event_mismatches,
             "unexpected_timeline_labels": unexpected_timeline_labels,
             "missing_timeline_metadata": missing_timeline_metadata,
@@ -883,7 +697,7 @@ def build_manifest(
     attachments: list[dict[str, Any]],
     timeline_rows: list[dict[str, Any]],
     integrity: dict[str, Any],
-    exhibit_summary: dict[str, Any],
+    render_summary: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "build_timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -894,10 +708,13 @@ def build_manifest(
         "timeline_row_count": len(timeline_rows),
         "generated_bundle_path": str(output_dir),
         "integrity_status": integrity["status"],
-        "attachment_packet_pdf_path": exhibit_summary.get("attachment_packet_pdf_path", ""),
-        "generated_exhibit_pdf_count": exhibit_summary.get("generated_exhibit_pdf_count", 0),
-        "reused_exhibit_pdf_count": exhibit_summary.get("reused_exhibit_pdf_count", 0),
-        "exhibit_generation_warning_count": len(exhibit_summary.get("exhibit_generation_warnings", [])),
+        "pdf_attachment_count": render_summary.get("pdf_attachment_count", 0),
+        "rendered_pdf_attachment_count": render_summary.get("rendered_pdf_attachment_count", 0),
+        "rendered_pdf_page_count": render_summary.get("rendered_pdf_page_count", 0),
+        "inline_printable_attachment_count": render_summary.get("inline_printable_attachment_count", 0),
+        "non_inline_printable_attachment_count": render_summary.get("non_inline_printable_attachment_count", 0),
+        "render_asset_warning_count": len(render_summary.get("render_asset_warnings", [])),
+        "rendered_pages_location": render_summary.get("rendered_pages_location", ""),
         "script_name": Path(__file__).name,
         "script_version": SCRIPT_VERSION,
     }
@@ -908,7 +725,7 @@ def render_index(
     attachments: list[dict[str, Any]],
     timeline_rows: list[dict[str, Any]],
     integrity: dict[str, Any],
-    exhibit_summary: dict[str, Any],
+    render_summary: dict[str, Any],
     ai_triage: dict[str, Any],
     manifest: dict[str, Any],
 ) -> str:
@@ -918,7 +735,7 @@ def render_index(
             "attachments": attachments,
             "timeline": timeline_rows,
             "integrity": integrity,
-            "exhibits": exhibit_summary,
+            "renderAssets": render_summary,
             "manifest": manifest,
             "ai": {
                 "available": bool(ai_triage.get("available")),
@@ -966,11 +783,12 @@ def render_index(
       display: grid;
       gap: 12px;
       padding: 16px 20px 14px;
-      border-bottom: 1px solid var(--line);
+      border-bottom: 1px solid #eef0f2;
       background: #fff;
+      box-shadow: 0 4px 14px rgba(24, 35, 39, 0.03);
       z-index: 3;
     }
-    h1 { margin: 0; font-size: 20px; line-height: 1.15; }
+    h1 { margin: 0; font-size: 24px; line-height: 1.1; letter-spacing: .02em; }
     h2 { margin: 0 0 10px; font-size: 15px; }
     h3 { margin: 14px 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0; }
     main {
@@ -985,19 +803,102 @@ def render_index(
       gap: 8px;
       flex-wrap: wrap;
     }
-    .header-top { justify-content: space-between; }
-    .search-row { flex-wrap: nowrap; }
-    .search-row input { flex: 1 1 70%; min-width: 220px; }
-    .search-row button { flex: 0 0 calc(15% - 4px); width: auto; min-width: 92px; padding-inline: 10px; }
+    .header-top {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: start;
+      gap: 12px;
+    }
+    .header-brand {
+      grid-column: 2;
+      display: grid;
+      justify-items: center;
+      gap: 4px;
+      text-align: center;
+    }
+    .header-subtitle {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    .header-meta {
+      justify-content: center;
+      gap: 6px;
+      color: #6f7b81;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .header-actions {
+      grid-column: 3;
+      justify-self: end;
+    }
+    .mode-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .results-count {
+      color: #6f7b81;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .search-row {
+      margin-top: 10px;
+      width: 100%;
+      min-width: min(100%, 560px);
+      flex-wrap: nowrap;
+      justify-content: flex-start;
+      align-items: center;
+      gap: 10px;
+    }
+    .search-row input {
+      flex: 1 1 auto;
+      min-width: 220px;
+      max-width: 60vw;
+      min-height: 38px;
+    }
+    .search-actions {
+      display: inline-flex;
+      justify-content: flex-start;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+    .search-actions button {
+      width: 110px;
+      min-width: 110px;
+      min-height: 38px;
+      white-space: nowrap;
+    }
+    #toggleFilters {
+      background: var(--accent-soft);
+      border-color: #b8cfcb;
+      color: var(--accent);
+    }
+    #clearFilters {
+      background: #f4ede2;
+      border-color: #d9c5a6;
+      color: #7d5521;
+    }
     .left, .right { padding: 26px 14px 14px; min-width: 0; overflow: hidden; }
-    .left { border-right: 1px solid var(--line); }
-    .right { display: flex; }
+    .left {
+      border-right: 1px solid #e1e7e5;
+      background: #f7f9fa;
+    }
+    .right {
+      display: flex;
+      background: #f8f9fa;
+    }
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 12px;
       margin-bottom: 12px;
+      box-shadow: 0 10px 24px rgba(24, 35, 39, 0.06);
     }
     #detailPanel {
       width: 100%;
@@ -1048,6 +949,13 @@ def render_index(
       white-space: nowrap;
     }
     .mode-row { gap: 6px; }
+    .mode-label {
+      color: #6f7b81;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
     .mode-row button {
       width: auto;
       min-width: 110px;
@@ -1062,6 +970,8 @@ def render_index(
     }
     .list {
       display: grid;
+      align-content: start;
+      grid-auto-rows: max-content;
       gap: 7px;
       height: 100%;
       min-height: 0;
@@ -1076,15 +986,20 @@ def render_index(
       cursor: pointer;
     }
     .item:hover { border-color: #b9c5c1; }
-    .item.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+    .item.active {
+      border-color: #17565f;
+      background: #f3f9f8;
+      box-shadow: inset 0 0 0 2px #17565f, inset 6px 0 0 #17565f;
+    }
     .item.match {
-      border-color: #d1b15f;
-      background: #fffdf5;
+      border-color: #d1b15f !important;
+      background: #fffdf5 !important;
       box-shadow: inset 3px 0 0 #d1b15f;
     }
     .item.match.active {
-      border-color: var(--accent);
-      box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 2px #f2d985;
+      border-color: #17565f;
+      background: linear-gradient(0deg, #f3f9f8, #f3f9f8), #fffdf5;
+      box-shadow: inset 0 0 0 2px #17565f, inset 6px 0 0 #17565f, inset 0 0 0 4px #f2d985;
     }
     .item-title {
       display: flex;
@@ -1094,44 +1009,66 @@ def render_index(
       margin-bottom: 5px;
     }
     .summary {
-      font-weight: 650;
+      font-size: 12px;
+      font-weight: 600;
+      color: #6f7b81;
       overflow-wrap: anywhere;
     }
     .timestamp {
-      color: var(--muted);
-      font-size: 12px;
+      color: #858f94;
+      font-size: 11px;
       white-space: nowrap;
     }
-    .meta { color: var(--muted); font-size: 12px; }
+    .meta { color: #7e888d; font-size: 11px; }
     .body-preview {
-      margin-top: 6px;
-      color: #344044;
+      margin-top: 8px;
+      color: #273337;
+      font-size: 14px;
+      line-height: 1.55;
       overflow-wrap: anywhere;
     }
     .tag-row { margin-top: 8px; }
     .timeline-slice {
       display: grid;
-      gap: 7px;
+      gap: 18px;
     }
     .slice-separator {
-      display: flex;
+      display: grid;
+      grid-template-columns: 1fr;
       align-items: center;
-      justify-content: center;
-      gap: 10px;
+      gap: 6px 10px;
       color: var(--muted);
       font-size: 12px;
       margin: 2px 0;
     }
-    .slice-separator::before,
-    .slice-separator::after {
+    .slice-separator-top,
+    .slice-separator-bottom {
+      justify-self: center;
+    }
+    .slice-separator-line {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 10px;
+    }
+    .slice-separator-line::before,
+    .slice-separator-line::after {
       content: "";
       height: 1px;
-      flex: 1 1 auto;
       background: var(--line);
+    }
+    .slice-separator-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 0;
+      text-align: center;
+      font-weight: 600;
     }
     .slice-separator button {
       width: auto;
-      min-width: 96px;
+      min-width: 118px;
       min-height: 28px;
       padding: 3px 8px;
       background: #fff;
@@ -1142,27 +1079,233 @@ def render_index(
     .timeline-row {
       border-radius: 7px;
       cursor: pointer;
+      margin-bottom: 6px;
+      position: relative;
     }
     .timeline-bubble {
-      max-width: 88%;
-      padding: 9px 10px;
+      width: fit-content;
+      max-width: 72%;
+      padding: 12px 14px 14px 36px;
+      border-width: 1px;
+      border-radius: 18px;
     }
     .timeline-bubble.direction-outbound {
       justify-self: end;
-      background: #f8efe9;
+      margin-left: auto;
+      background: #ffffff;
+      border-color: #d7dfdc;
+      box-shadow: 0 6px 18px rgba(24, 35, 39, 0.04);
     }
     .timeline-bubble.direction-inbound {
       justify-self: start;
-      background: #edf5ff;
+      margin-right: auto;
+      background: #eef3f8;
+      border-color: #d0dbe6;
+      box-shadow: 0 6px 18px rgba(52, 77, 102, 0.05);
     }
     .timeline-email {
       width: 100%;
-      background: #fff;
+      border-width: 1px;
+      border-style: solid;
+      border-color: #dcdfe3;
+      background: #ffffff;
+      box-shadow: 0 8px 22px rgba(24, 35, 39, 0.05);
+      display: grid;
+      gap: 6px;
+      border-radius: 2px;
+      padding: 12px 14px 14px 38px;
+    }
+    .timeline-email.direction-inbound {
+      border-color: #dcdfe3;
+      background: #eef3f8;
+    }
+    .timeline-email.direction-outbound {
+      border-color: #dcdfe3;
+      background: #ffffff;
+    }
+    .timeline-source-icon {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      color: #b3b8bc;
+      font-size: 13px;
+      line-height: 1;
+      font-weight: 600;
+      pointer-events: none;
+    }
+    .timeline-source-icon.text::before { content: "💬"; }
+    .timeline-source-icon.email::before { content: "✉"; }
+    .email-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: baseline;
+      min-width: 0;
+    }
+    .email-header {
+      display: grid;
+      gap: 6px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #d7dde3;
+      margin-bottom: 2px;
+    }
+    .email-side {
+      display: grid;
+      justify-items: end;
+      align-items: start;
+      gap: 4px;
+    }
+    .email-sender,
+    .email-subject,
+    .timeline-email .body-preview {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      word-break: break-word;
+    }
+    .email-sender {
+      -webkit-line-clamp: 1;
+      color: #6f7b81;
+      font-size: 12px;
+      font-weight: 600;
     }
     .email-subject {
       color: #344044;
       font-weight: 650;
+      -webkit-line-clamp: 1;
+    }
+    .email-short-date {
+      color: #858f94;
+      font-size: 11px;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .timeline-email .body-preview {
+      color: #2d383d;
+      -webkit-line-clamp: 1;
+      margin-top: 0;
+    }
+    .message-ledger {
+      width: 100%;
+      position: relative;
+      padding: 10px 12px 11px 36px;
+      display: grid;
+      gap: 6px;
+      border-width: 1px;
+    }
+    .message-ledger.direction-inbound {
+      background: #eef3f8;
+      border-color: #d0dbe6;
+    }
+    .message-ledger.direction-outbound {
+      background: #ffffff;
+      border-color: #d7dfdc;
+    }
+    .message-ledger.medium-email {
+      border-radius: 2px;
+      border-color: #dcdfe3;
+    }
+    .message-ledger.medium-text {
+      border-radius: 12px;
+    }
+    .message-ledger .timeline-source-icon {
+      top: 9px;
+    }
+    .message-ledger-meta {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px 12px;
+      align-items: start;
+      min-width: 0;
+    }
+    .message-ledger-identity,
+    .message-ledger-right {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: baseline;
+      min-width: 0;
+    }
+    .message-ledger-identity {
+      color: #6f7b81;
+      font-size: 11px;
+      line-height: 1.35;
       overflow-wrap: anywhere;
+    }
+    .message-ledger-right {
+      justify-content: flex-end;
+      color: #858f94;
+      font-size: 11px;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+    .message-ledger-id {
+      font-weight: 700;
+      color: #657279;
+      letter-spacing: .01em;
+    }
+    .message-ledger-email-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: start;
+      min-width: 0;
+    }
+    .message-ledger-subject {
+      color: #253136;
+      font-size: 15px;
+      font-weight: 800;
+      line-height: 1.25;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 1;
+      text-overflow: ellipsis;
+      word-break: break-word;
+    }
+    .message-ledger-snippet {
+      color: #273337;
+      font-size: 13px;
+      line-height: 1.45;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      text-overflow: ellipsis;
+      word-break: break-word;
+    }
+    .message-ledger-tags {
+      margin-top: 0;
+    }
+    .timeline-preview {
+      margin-top: 8px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid rgba(31, 55, 66, .16);
+      background: rgba(255,255,255,.72);
+    }
+    .timeline-preview img {
+      display: block;
+      width: 100%;
+      max-height: 190px;
+      object-fit: cover;
+      background: #fff;
+    }
+    .timeline-preview-more {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding: 5px 8px;
+      background: rgba(22, 53, 64, .06);
+      color: #36535a;
+      font-size: 12px;
+      font-weight: 650;
     }
     .match-label {
       display: inline-flex;
@@ -1197,6 +1340,7 @@ def render_index(
     .badge.direction-inbound { background: #eaf2ff; border-color: #c4d8f4; color: #2e5f95; }
     .badge.direction-outbound { background: #f9eee8; border-color: #e7cdbc; color: #8a4d2b; }
     .badge.attach { background: #eef3fb; border-color: #cad8ec; color: #2f527d; font-weight: 650; }
+    .badge.attach-count { background: #eef3fb; border-color: #cad8ec; color: #2f527d; font-weight: 700; min-width: 0; }
     .badge.nearby { background: #f4edfb; border-color: #ddc9ec; color: #68447f; font-weight: 650; }
     .badge.kind-image { background: #eaf7ee; border-color: #bfe0ca; color: #2b6b3d; }
     .badge.kind-pdf { background: #fdeceb; border-color: #efc0bc; color: #943b35; }
@@ -1333,22 +1477,138 @@ def render_index(
       background: transparent;
       color: var(--accent);
     }
+    .detail-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .detail-header h2 { margin: 0; }
+    .detail-header button {
+      width: auto;
+      min-width: 130px;
+      flex: 0 0 auto;
+    }
     .detail-grid { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 6px 10px; }
+    .detail-grid.compact { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+    .detail-cell {
+      border: 1px solid var(--soft-line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fbfbf8;
+      min-width: 0;
+    }
+    .detail-cell .key {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+    }
+    .detail-cell .value {
+      color: var(--ink);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
     .key { color: var(--muted); }
     .value { overflow-wrap: anywhere; }
+    .message-body-area {
+      max-height: 60vh;
+      overflow: auto;
+      margin-bottom: 12px;
+    }
+    .message-heading {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #d9dfe3;
+    }
+    .message-heading-subject {
+      color: #253136;
+      font-size: 17px;
+      font-weight: 800;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+    .message-heading-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px 12px;
+    }
+    .message-heading-cell {
+      min-width: 0;
+    }
+    .message-heading-cell .key {
+      display: block;
+      margin-bottom: 3px;
+      color: #7a868c;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .message-heading-cell .value {
+      color: #2a353a;
+      font-size: 13px;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
     .body-box, textarea {
       white-space: pre-wrap;
       background: #fbfbf8;
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 10px;
-      max-height: 300px;
+      max-height: min(62vh, 780px);
       overflow: auto;
+    }
+    .message-body-area .body-box {
+      max-height: none;
+      margin: 0;
+    }
+    .message-gallery {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin: 12px 0 0;
+    }
+    .message-gallery figure {
+      display: grid;
+      place-items: center;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: auto;
+      background: #fbfbf8;
+      padding: 8px;
+      align-items: start;
+    }
+    .message-gallery img {
+      display: block;
+      width: auto;
+      max-width: 100%;
+      height: auto;
+      max-height: min(52vh, 800px);
+      object-fit: contain;
+      background: #fff;
     }
     .attachment {
       border-top: 1px solid var(--line);
       padding-top: 10px;
       margin-top: 10px;
+    }
+    .attachment-meta {
+      margin-bottom: 10px;
+    }
+    .attachment-meta-toggle summary {
+      margin-bottom: 8px;
+    }
+    .attachment-meta-toggle {
+      margin-left: 16px;
+      padding-left: 12px;
+      border-left: 2px solid var(--soft-line);
     }
     .attachment-preview {
       margin: 10px 0;
@@ -1404,15 +1664,76 @@ def render_index(
       padding: 10px;
       color: var(--muted);
     }
+    .inline-message-image {
+      margin: 0 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fbfbf8;
+    }
+    .inline-message-image img {
+      display: block;
+      width: 100%;
+      max-height: 460px;
+      object-fit: contain;
+      background: #fff;
+    }
     details {
       border-top: 1px solid var(--soft-line);
       padding-top: 9px;
       margin-top: 9px;
     }
     summary { cursor: pointer; color: var(--accent); font-weight: 650; }
+    .detail-section-empty {
+      display: block;
+      color: #95a0a5;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 0 8px;
+    }
     a { color: var(--accent); overflow-wrap: anywhere; }
     .warning { color: var(--warn); font-weight: 650; }
     .empty { color: var(--muted); padding: 18px 8px; text-align: center; }
+    #detailPanel .empty {
+      display: grid;
+      place-items: center;
+      align-content: center;
+      gap: 12px;
+      min-height: 100%;
+      color: #8d989d;
+      padding: 28px 18px;
+      text-align: center;
+    }
+    .empty-icon {
+      width: 44px;
+      height: 44px;
+      border: 1px solid #d7dfdc;
+      border-radius: 999px;
+      background: #f7f9fa;
+      position: relative;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.9);
+    }
+    .empty-icon::before {
+      content: "";
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #8d989d;
+      border-radius: 999px;
+      top: 10px;
+      left: 10px;
+    }
+    .empty-icon::after {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 2px;
+      background: #8d989d;
+      border-radius: 999px;
+      transform: rotate(45deg);
+      right: 8px;
+      bottom: 11px;
+    }
     .muted { color: var(--muted); }
     .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .header-actions label { display: flex; align-items: center; gap: 6px; }
@@ -1420,6 +1741,9 @@ def render_index(
     .header-actions button { width: auto; min-width: 116px; }
     .print-menu {
       position: relative;
+      border-top: 0;
+      padding-top: 0;
+      margin-top: 0;
     }
     .print-menu summary {
       display: inline-flex;
@@ -1459,6 +1783,59 @@ def render_index(
       text-align: left;
     }
     .thread-context button, .row-actions button { width: auto; min-width: 120px; }
+    .thread-context button:disabled {
+      opacity: .45;
+      cursor: default;
+    }
+    .thread-context {
+      max-height: 60vh;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .thread-context-note {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      border: 1px solid #ead7d7;
+      border-radius: 10px;
+      background: #fcf5f5;
+      color: #6a5a5a;
+      font-size: 12px;
+      line-height: 1.45;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+    }
+    .thread-context-note-icon {
+      flex: 0 0 auto;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: #f2dede;
+      color: #8a5c5c;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 18px;
+      text-align: center;
+    }
+    .thread-context-note strong {
+      color: #6f4747;
+      font-weight: 600;
+    }
+    .thread-context-nav {
+      display: flex;
+      justify-content: center;
+      margin: 8px 0;
+    }
+    .thread-context .timeline-slice {
+      margin-top: 8px;
+    }
+    .thread-context .timeline-row {
+      cursor: default;
+    }
+    .thread-context .timeline-row button {
+      min-width: 0;
+    }
     .row-actions a, .link-button {
       display: inline-flex;
       align-items: center;
@@ -1486,44 +1863,55 @@ def render_index(
       #detailPanel { max-height: 58vh; }
       .list { max-height: 44vh; padding-bottom: 10px; }
       .advanced { grid-template-columns: 1fr; }
-      .search-row { flex-wrap: wrap; }
-      .search-row input, .search-row button { flex: 1 1 auto; }
+      .header-top {
+        grid-template-columns: 1fr;
+        justify-items: center;
+      }
+      .header-brand,
+      .header-actions {
+        grid-column: auto;
+      }
+      .header-actions { justify-self: center; }
+      .search-row { width: 100%; min-width: 0; flex-wrap: wrap; }
+      .search-row input { flex: 1 1 100%; max-width: none; }
+      .search-actions { width: 100%; justify-content: flex-start; }
+      .mode-bar {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+      }
+      .results-count {
+        width: 100%;
+      }
+      .mode-bar .header-actions {
+        width: 100%;
+        justify-self: auto;
+      }
       .mode-row button { flex: 1; min-width: 0; }
+      .detail-header { align-items: stretch; flex-direction: column; }
+      .message-heading-grid { grid-template-columns: 1fr; }
+      .detail-grid.compact { grid-template-columns: 1fr; }
+      .timeline-bubble { max-width: 100%; }
     }
   </style>
 </head>
 <body>
   <header>
     <div class="header-top">
-      <h1>Attorney Review Bundle</h1>
-      <div class="meta">
-        <span id="counts"></span>
-        <span id="integrityStatus"></span>
-      </div>
-      <div class="header-actions">
-        <details class="print-menu" id="printMenu">
-          <summary>Print</summary>
-          <div class="print-menu-body">
-            <label>Print level
-              <select id="printLevel">
-                <option value="standard" selected>Standard</option>
-                <option value="summary">Summary</option>
-                <option value="full">Full</option>
-              </select>
-            </label>
-            <button class="secondary" id="printCurrent" type="button">Print Current Message</button>
-            <button class="secondary" id="printResults" type="button">Print Results</button>
-            <button class="secondary" id="printSummary" type="button">Print Summary</button>
-            <button class="secondary" id="printAttachments" type="button">Print Filtered Attachments</button>
-            <a class="button-link" id="packetPdfLink" target="_blank" rel="noopener">Print Full Packet</a>
-          </div>
-        </details>
+      <div class="header-brand">
+        <h1>WireTapped</h1>
+        <div class="header-subtitle">Communications Intelligence Console</div>
+        <div class="meta header-meta">
+          <span id="counts"></span>
+          <span id="integrityStatus" hidden></span>
+        </div>
       </div>
     </div>
     <div class="search-row">
       <input id="search" type="search" placeholder="Search messages, people, filenames, IDs, paths">
-      <button class="secondary" id="toggleFilters" type="button">Add filter</button>
-      <button class="secondary" id="clearFilters" type="button">Clear</button>
+      <div class="search-actions">
+        <button class="secondary" id="toggleFilters" type="button">Add filter</button>
+        <button class="secondary" id="clearFilters" type="button">Clear</button>
+      </div>
     </div>
     <div class="chips" id="activeChips"></div>
     <div class="advanced" id="advancedFilters" hidden>
@@ -1540,10 +1928,24 @@ def render_index(
       <label>End date<input id="endDate" type="date"></label>
       <label id="aiTagFilterLabel" hidden>AI tag<select id="aiTagFilter"><option value="">Any AI tag</option></select></label>
     </div>
-    <div class="mode-row" role="tablist" aria-label="Review mode">
-      <button id="messagesTab" type="button" aria-selected="true">Messages</button>
-      <button id="timelineTab" type="button" aria-selected="false">Timeline</button>
-      <button id="attachmentsTab" type="button" aria-selected="false">Attachments</button>
+    <div class="mode-bar">
+      <div class="mode-row" role="tablist" aria-label="Review mode">
+        <span class="mode-label">View:</span>
+        <button id="timelineTab" type="button" aria-selected="true">Timeline</button>
+        <button id="messagesTab" type="button" aria-selected="false">Messages</button>
+      </div>
+      <div class="results-count" id="resultsCount"></div>
+      <div class="header-actions">
+        <details class="print-menu" id="printMenu">
+          <summary>Print</summary>
+          <div class="print-menu-body">
+            <button class="secondary" id="printCurrent" type="button">Print Current Message</button>
+            <button class="secondary" id="printResults" type="button">Print Results</button>
+            <button class="secondary" id="printSummary" type="button">Print Summary</button>
+            <button class="secondary" id="printFullPacket" type="button">Print Full Packet</button>
+          </div>
+        </details>
+      </div>
     </div>
   </header>
   <main>
@@ -1561,17 +1963,18 @@ def render_index(
     const attachments = data.attachments;
     const timeline = data.timeline;
     const integrity = data.integrity;
-    const exhibits = data.exhibits || {};
+    const renderAssets = data.renderAssets || {};
     const manifest = data.manifest || {};
     const ai = data.ai || {};
     const CONVERSATION_ATTACHMENT_WINDOW_HOURS = 24;
     const CONVERSATION_ATTACHMENT_LIMIT = 12;
     const TIMELINE_CONTEXT_SIZE = 3;
     const TIMELINE_EXPAND_SIZE = 5;
-    let activeView = 'messages';
-    let activeEventId = messages[0]?.event_id || '';
-    let activeAttachmentId = attachments[0]?.attachment_id || '';
+    let activeView = 'timeline';
+    let activeEventId = '';
+    let activeAttachmentId = '';
     const timelineExpansion = new Map();
+    const threadContextExpansion = new Map();
 
     const els = {
       counts: document.getElementById('counts'),
@@ -1592,25 +1995,35 @@ def render_index(
       detail: document.getElementById('detailPanel'),
       messagesTab: document.getElementById('messagesTab'),
       timelineTab: document.getElementById('timelineTab'),
-      attachmentsTab: document.getElementById('attachmentsTab'),
+      resultsCount: document.getElementById('resultsCount'),
       printMenu: document.getElementById('printMenu'),
       printCurrent: document.getElementById('printCurrent'),
       printResults: document.getElementById('printResults'),
       printSummary: document.getElementById('printSummary'),
-      printAttachments: document.getElementById('printAttachments'),
-      packetPdfLink: document.getElementById('packetPdfLink'),
-      printLevel: document.getElementById('printLevel'),
+      printFullPacket: document.getElementById('printFullPacket'),
     };
-    if (exhibits.attachment_packet_pdf_path) {
-      els.packetPdfLink.href = exhibits.attachment_packet_pdf_path;
-    } else {
-      els.packetPdfLink.hidden = true;
-    }
 
     function participantKey(value) {
       const text = String(value || '').trim().toLowerCase();
       const digits = text.replace(/\\D/g, '');
       if (digits.length >= 10) return digits.slice(-10);
+      return text;
+    }
+    function normalizeMessageId(value) {
+      const text = String(value || '').trim();
+      if (!text) return '';
+      const match = text.match(/^<(.+)>$/);
+      return (match ? match[1] : text).trim().toLowerCase();
+    }
+    function looksLikeMessageId(value) {
+      return Boolean(normalizeMessageId(value)) && /@/.test(String(value || ''));
+    }
+    function normalizedEmailSubject(value) {
+      const text = String(value || '')
+        .replace(/^(?:\\s*(?:re|fw|fwd)\\s*:\\s*)+/i, '')
+        .replace(/\\s+/g, ' ')
+        .trim()
+        .toLowerCase();
       return text;
     }
     function conversationKey(message) {
@@ -1629,6 +2042,9 @@ def render_index(
     const chronologicalIndex = new Map(chronologicalMessages.map((message, index) => [message.event_id, index]));
     const byThread = new Map();
     const byConversation = new Map();
+    const emailByMessageId = new Map();
+    const emailGraph = new Map();
+    const emailFallbackBySubjectConversation = new Map();
     messages.forEach(message => {
       const key = message.thread_key || message.event_id;
       if (!byThread.has(key)) byThread.set(key, []);
@@ -1636,13 +2052,35 @@ def render_index(
       const conversation = conversationKey(message);
       if (!byConversation.has(conversation)) byConversation.set(conversation, []);
       byConversation.get(conversation).push(message);
+      if (isEmailRecord(message)) {
+        const messageId = normalizeMessageId(message.source_record_id);
+        if (messageId) emailByMessageId.set(messageId, message);
+        emailGraph.set(message.event_id, new Set());
+        const normalizedSubject = normalizedEmailSubject(message.subject);
+        if (normalizedSubject) {
+          const fallbackKey = `${conversation}||${normalizedSubject}`;
+          if (!emailFallbackBySubjectConversation.has(fallbackKey)) emailFallbackBySubjectConversation.set(fallbackKey, []);
+          emailFallbackBySubjectConversation.get(fallbackKey).push(message);
+        }
+      }
+    });
+    messages.forEach(message => {
+      if (!isEmailRecord(message)) return;
+      const parentMessageId = looksLikeMessageId(message.thread_key) ? normalizeMessageId(message.thread_key) : '';
+      if (!parentMessageId) return;
+      const parent = emailByMessageId.get(parentMessageId);
+      if (!parent || parent.event_id === message.event_id) return;
+      emailGraph.get(message.event_id)?.add(parent.event_id);
+      emailGraph.get(parent.event_id)?.add(message.event_id);
     });
     els.counts.textContent = `${messages.length} messages | ${attachments.length} attachments | ${timeline.length} timeline rows`;
     els.integrityStatus.textContent = `Integrity: ${integrity.status}`;
-    if (integrity.status !== 'pass') els.integrityStatus.className = 'warning';
 
     function optionList(values) {
       return '<option value="">Any</option>' + [...new Set(values.filter(Boolean))].sort().map(value => `<option>${escapeHtml(value)}</option>`).join('');
+    }
+    function isEmailRecord(message) {
+      return String(message?.source || '').toLowerCase().includes('email');
     }
     els.source.innerHTML = optionList(messages.map(m => m.source));
     els.direction.innerHTML = optionList(messages.map(m => m.direction));
@@ -1697,6 +2135,22 @@ def render_index(
     function formatDateOnly(value) {
       const match = String(value || '').match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
       return match ? `${match[2]}/${match[3]}/${match[1]}` : String(value || '');
+    }
+    function formatShortDateTime(value) {
+      const text = String(value || '');
+      if (!text) return '';
+      const normalized = text.includes('T') ? text : text.replace(' ', 'T');
+      const date = new Date(normalized);
+      if (Number.isNaN(date.getTime())) return text;
+      return new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        month: '2-digit',
+        day: '2-digit',
+        year: '2-digit',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      }).format(date);
     }
     function inDateRange(iso) {
       const day = (iso || '').slice(0, 10);
@@ -1781,24 +2235,40 @@ def render_index(
         .map(attachment => ({ message: byEvent.get(attachment.event_id) || {}, attachment }))
         .sort((a, b) => String(a.message.event_dt_utc || '').localeCompare(String(b.message.event_dt_utc || '')) || String(a.attachment.attachment_id || '').localeCompare(String(b.attachment.attachment_id || '')));
     }
-    function citation(message) {
-      const excerpt = String(message.body_clean || '').replace(/\\s+/g, ' ').trim().slice(0, 160);
-      return `${message.event_id} | ${formatDateTime(message.event_dt_utc)} | ${message.source} | ${excerpt}`;
+    function previewableImageAttachments(message) {
+      return (message.attachments || []).filter(att => {
+        if (attachmentKind(att) !== 'image') return false;
+        const href = String(att.preferred_view_path || att.bundle_saved_path || '').toLowerCase();
+        return Boolean(href) && !/\\.heics?$/.test(href);
+      });
     }
-    async function copyCitation() {
-      const message = byEvent.get(activeEventId);
-      if (!message) return;
-      const value = citation(message);
-      try {
-        await navigator.clipboard.writeText(value);
-      } catch (err) {
-        const field = document.getElementById('citationText');
-        if (field) {
-          field.focus();
-          field.select();
-          document.execCommand('copy');
-        }
-      }
+    function messageBodyText(message) {
+      return String(message.body_clean || '').trim();
+    }
+    function displayBodyPreviewText(message) {
+      const body = messageBodyText(message);
+      if (body) return body;
+      const subject = String(message.subject || '').trim();
+      if (isEmailMessage(message) && subject) return `[subject only]`;
+      return message.body_preview || message.display_summary || '[no message body]';
+    }
+    function messagePreviewText(message, fallback = '[no message body]') {
+      const body = displayBodyPreviewText(message);
+      return body || fallback;
+    }
+    function messageLedgerIdentityText(message) {
+      const sender = message.display_sender || message.sender || message.source || 'Message';
+      return sender;
+    }
+    function timelineInlinePreviewHtml(message) {
+      const href = message.inline_preview_path;
+      if (!href) return '';
+      const extra = Number(message.additional_inline_image_count || 0);
+      return `
+        <div class="timeline-preview">
+          <img src="${escapeHtml(href)}" alt="${escapeHtml(message.inline_preview_attachment_id || message.event_id || 'MMS image')}">
+          ${extra > 0 ? `<div class="timeline-preview-more">+ ${extra} more</div>` : ''}
+        </div>`;
     }
     function nearbyConversationAttachmentEntries(message, includeCurrentMessage) {
       const selectedMs = Date.parse(message.event_dt_utc || '');
@@ -1840,6 +2310,24 @@ def render_index(
       const labels = { image: 'IMAGE', pdf: 'PDF', video: 'VIDEO', audio: 'AUDIO', doc: 'DOC', archive: 'ARCHIVE', mixed: 'MIXED', other: 'OTHER' };
       return labels[kind] || String(kind || '').toUpperCase();
     }
+    function currentSearchQuery() {
+      return els.search.value.trim().toLowerCase();
+    }
+    function attachmentCountBadge(count) {
+      return count ? `<span class="badge attach-count" title="${count} attachment${count === 1 ? '' : 's'}">${tagIcon('attach')}${count}</span>` : '';
+    }
+    function timelineSourceIconHtml(message) {
+      return `<span class="timeline-source-icon ${isEmailMessage(message) ? 'email' : 'text'}" aria-hidden="true"></span>`;
+    }
+    function messageViewBadges(message) {
+      const badges = [];
+      if (message.is_attachment_only) badges.push(`<span class="badge warn">${tagIcon('warn')}Attachment only</span>`);
+      if (message.has_exif_attachment) badges.push(`<span class="badge exif">${tagIcon('exif')}EXIF time</span>`);
+      if (message.ai_tags && message.ai_tags.length) {
+        badges.push(...message.ai_tags.map(tag => `<span class="badge ai">${tagIcon('ai')}${escapeHtml(tag)}</span>`));
+      }
+      return badges.join('');
+    }
     function renderBadges(message) {
       const sourceClass = `source-${safeClass(message.source_badge || message.source)}`;
       const directionClass = `direction-${safeClass(message.direction || message.direction_badge)}`;
@@ -1848,12 +2336,8 @@ def render_index(
         `<span class="badge source ${sourceClass}">${tagIcon('source')}${escapeHtml(message.source_badge || message.source)}</span>`,
         `<span class="badge direction ${directionClass}">${tagIcon(directionIcon)}${escapeHtml(message.direction_badge || message.direction)}</span>`,
       ];
-      const nearbyAttachmentCount = nearbyConversationAttachmentEntries(message, false).length;
       const directKind = attachmentKindSummary(message.attachments || []);
-      const nearbyEntries = nearbyConversationAttachmentEntries(message, false);
-      const nearbyKind = attachmentKindSummary(nearbyEntries.map(entry => entry.attachment));
       if (message.attachment_count) badges.push(`<span class="badge attach kind-${safeClass(directKind)}">${tagIcon('attach')}ATT ${message.attachment_count} ${kindLabel(directKind)}</span>`);
-      if (nearbyAttachmentCount) badges.push(`<span class="badge nearby kind-${safeClass(nearbyKind)}">${tagIcon('nearby')}NEARBY ${nearbyAttachmentCount} ${kindLabel(nearbyKind)}</span>`);
       if (message.is_attachment_only) badges.push(`<span class="badge warn">${tagIcon('warn')}Attachment only</span>`);
       if (message.has_exif_attachment) badges.push(`<span class="badge exif">${tagIcon('exif')}EXIF time</span>`);
       if (message.ai_tags && message.ai_tags.length) {
@@ -1887,27 +2371,34 @@ def render_index(
       }));
     }
     function isEmailMessage(message) {
-      return String(message.source || '').toLowerCase().includes('email');
+      return isEmailRecord(message);
     }
     function directionCss(message) {
       return safeClass(message.direction).includes('out') ? 'direction-outbound' : 'direction-inbound';
     }
     function attachmentIndicatorHtml(message) {
-      const directKind = attachmentKindSummary(message.attachments || []);
-      const pieces = [];
-      if (message.attachment_count) pieces.push(`<span class="badge attach kind-${safeClass(directKind)}">${tagIcon('attach')}${message.attachment_count} ${kindLabel(directKind)}</span>`);
-      if (message.is_attachment_only) pieces.push(`<span class="badge warn">${tagIcon('warn')}Attachment only</span>`);
-      if (message.has_exif_attachment) pieces.push(`<span class="badge exif">${tagIcon('exif')}EXIF time</span>`);
-      return pieces.join('');
+      return '';
     }
-    function timelineRanges() {
-      const matches = filteredMessages()
+    function directMatchIndexes() {
+      const query = currentSearchQuery();
+      if (!query) return [];
+      return messages
+        .filter(message => messageMatches(message, query))
         .map(message => chronologicalIndex.get(message.event_id))
         .filter(index => index !== undefined)
         .sort((a, b) => a - b);
+    }
+    function timelineRanges() {
+      const filtered = filteredMessages()
+        .map(message => chronologicalIndex.get(message.event_id))
+        .filter(index => index !== undefined)
+        .sort((a, b) => a - b);
+      if (!filtered.length) return { ranges: [], matchIndexes: new Set() };
+      const matches = directMatchIndexes();
       const matchIndexes = new Set(matches);
+      const sourceIndexes = matches.length ? matches : filtered;
       const ranges = [];
-      matches.forEach(index => {
+      sourceIndexes.forEach(index => {
         const range = {
           start: Math.max(0, index - TIMELINE_CONTEXT_SIZE),
           end: Math.min(chronologicalMessages.length - 1, index + TIMELINE_CONTEXT_SIZE),
@@ -1921,30 +2412,41 @@ def render_index(
       });
       return { ranges, matchIndexes };
     }
-    function timelineRowHtml(message, isMatch) {
+    function timelineRowHtml(message, isMatch, matchLabel = 'MATCH') {
       const activeClass = message.event_id === activeEventId ? 'active' : '';
       const matchClass = isMatch ? 'match' : '';
-      const commonAttrs = `data-event="${escapeHtml(message.event_id)}"`;
+      const commonAttrs = `data-event="${escapeHtml(message.event_id)}" data-select-event="${escapeHtml(message.event_id)}"`;
+      const bodyPreview = messagePreviewText(message, '[no preview]');
       if (isEmailMessage(message)) {
         return `
-          <article class="item timeline-row timeline-email ${activeClass} ${matchClass}" ${commonAttrs}>
-            <div class="item-title">
-              <span class="summary">${escapeHtml(message.display_sender || message.sender || 'Email')}</span>
-              <span class="timestamp">${escapeHtml(formatDateTime(message.event_dt_utc))}</span>
+          <article class="item timeline-row timeline-email ${directionCss(message)} ${activeClass} ${matchClass}" ${commonAttrs}>
+            ${timelineSourceIconHtml(message)}
+            <div class="email-header">
+              <div class="email-row">
+                <span class="email-sender">${escapeHtml(message.display_sender || message.sender || 'Email')}</span>
+                <div class="email-side">
+                  <span class="email-short-date">${escapeHtml(formatShortDateTime(message.event_dt_utc))}</span>
+                </div>
+              </div>
+              <div class="email-row">
+                <div class="email-subject">${escapeHtml(message.subject || '[no subject]')}</div>
+                <div class="email-side">${attachmentCountBadge(message.attachment_count || 0)}</div>
+              </div>
             </div>
-            <div class="email-subject">${escapeHtml(message.subject || '[no subject]')}</div>
-            <div class="body-preview">${escapeHtml(message.body_preview || message.display_summary || '[no preview]')}</div>
-            <div class="meta tag-row">${isMatch ? '<span class="match-label">MATCH</span>' : ''}${renderBadges(message)}</div>
+            <div class="body-preview">${escapeHtml(bodyPreview)}</div>
+            ${isMatch ? `<div class="meta tag-row"><span class="match-label">${escapeHtml(matchLabel)}</span></div>` : ''}
           </article>`;
       }
       return `
         <article class="item timeline-row timeline-bubble ${directionCss(message)} ${activeClass} ${matchClass}" ${commonAttrs}>
+          ${timelineSourceIconHtml(message)}
           <div class="item-title">
             <span class="summary">${escapeHtml(message.display_sender || message.sender || message.source || 'Message')}</span>
-            <span class="timestamp">${escapeHtml(formatDateTime(message.event_dt_utc))}</span>
+            <span class="timestamp">${escapeHtml(formatShortDateTime(message.event_dt_utc))}</span>
           </div>
-          <div class="body-preview">${escapeHtml(message.body_preview || message.display_summary || '[no body]')}</div>
-          <div class="meta tag-row">${isMatch ? '<span class="match-label">MATCH</span>' : ''}${attachmentIndicatorHtml(message)}</div>
+          ${timelineInlinePreviewHtml(message)}
+          ${bodyPreview && !message.is_attachment_only ? `<div class="body-preview">${escapeHtml(bodyPreview)}</div>` : ''}
+          ${isMatch ? `<div class="meta tag-row"><span class="match-label">${escapeHtml(matchLabel)}</span></div>` : ''}
         </article>`;
     }
     function renderTimelineList() {
@@ -1955,85 +2457,200 @@ def render_index(
       }
       const parts = [];
       ranges.forEach((range, rangeIndex) => {
+        const previousRange = ranges[rangeIndex - 1];
         const next = ranges[rangeIndex + 1];
+        const previousGapKey = previousRange ? `gap-${previousRange.end}-${range.start}` : '';
         const gapKey = `gap-${range.end}-${next ? next.start : 'end'}`;
-        const expansion = timelineExpansion.get(gapKey) || 0;
-        const visibleEnd = next ? Math.min(next.start - 1, range.end + expansion) : range.end;
+        const prevExpansion = previousGapKey ? (timelineExpansion.get(`${previousGapKey}:backward`) || 0) : 0;
+        const nextExpansion = timelineExpansion.get(`${gapKey}:next`) || 0;
+        const visibleStart = previousRange
+          ? Math.max(previousRange.end + 1, range.start - prevExpansion)
+          : range.start;
+        const visibleEnd = next ? Math.min(next.start - 1, range.end + nextExpansion) : range.end;
         parts.push('<section class="timeline-slice">');
-        for (let index = range.start; index <= visibleEnd; index += 1) {
+        for (let index = visibleStart; index <= visibleEnd; index += 1) {
           parts.push(timelineRowHtml(chronologicalMessages[index], matchIndexes.has(index)));
         }
         parts.push('</section>');
-        if (next && visibleEnd < next.start - 1) {
-          const skipped = next.start - visibleEnd - 1;
-          parts.push(`<div class="slice-separator"><span>skipped ${skipped} message${skipped === 1 ? '' : 's'}</span><button type="button" data-expand-gap="${escapeHtml(gapKey)}">Show more</button></div>`);
+        if (next) {
+          const nextVisibleStart = Math.max(
+            range.end + 1,
+            next.start - (timelineExpansion.get(`${gapKey}:backward`) || 0),
+          );
+          const hiddenBetween = Math.max(0, nextVisibleStart - visibleEnd - 1);
+          if (hiddenBetween > 0) {
+            parts.push(`
+              <div class="slice-separator">
+                <div class="slice-separator-top"><button type="button" data-expand-gap-next="${escapeHtml(gapKey)}">Next ${TIMELINE_EXPAND_SIZE}</button></div>
+                <div class="slice-separator-line"><span class="slice-separator-label">Skipped ${hiddenBetween} message${hiddenBetween === 1 ? '' : 's'}</span></div>
+                <div class="slice-separator-bottom"><button type="button" data-expand-gap-prev="${escapeHtml(gapKey)}">Previous ${TIMELINE_EXPAND_SIZE}</button></div>
+              </div>`);
+          }
         }
       });
       els.list.innerHTML = parts.join('');
     }
+    function visibleTimelineMessages() {
+      const { ranges } = timelineRanges();
+      const rows = [];
+      ranges.forEach((range, rangeIndex) => {
+        const previousRange = ranges[rangeIndex - 1];
+        const next = ranges[rangeIndex + 1];
+        const previousGapKey = previousRange ? `gap-${previousRange.end}-${range.start}` : '';
+        const gapKey = `gap-${range.end}-${next ? next.start : 'end'}`;
+        const prevExpansion = previousGapKey ? (timelineExpansion.get(`${previousGapKey}:backward`) || 0) : 0;
+        const nextExpansion = timelineExpansion.get(`${gapKey}:next`) || 0;
+        const visibleStart = previousRange
+          ? Math.max(previousRange.end + 1, range.start - prevExpansion)
+          : range.start;
+        const visibleEnd = next ? Math.min(next.start - 1, range.end + nextExpansion) : range.end;
+        for (let index = visibleStart; index <= visibleEnd; index += 1) {
+          rows.push(chronologicalMessages[index]);
+        }
+      });
+      return rows;
+    }
     function updateActiveItems() {
       els.list.querySelectorAll('.item.active').forEach(item => item.classList.remove('active'));
+      if (!activeEventId) return;
       els.list.querySelectorAll(`[data-event="${CSS.escape(activeEventId)}"]`).forEach(item => item.classList.add('active'));
       if (activeAttachmentId) {
         els.list.querySelectorAll(`[data-attachment="${CSS.escape(activeAttachmentId)}"]`).forEach(item => item.classList.add('active'));
       }
     }
+    function clearSelection() {
+      activeEventId = '';
+      activeAttachmentId = '';
+    }
     function selectEvent(eventId, attachmentId = '') {
       activeEventId = eventId;
-      if (attachmentId) activeAttachmentId = attachmentId;
+      activeAttachmentId = attachmentId || '';
       renderDetail();
       updateActiveItems();
     }
+    function separatorAnchorFromButton(button, direction) {
+      const separator = button.closest('.slice-separator');
+      if (!separator) return firstVisibleListAnchor();
+      const targetSection = direction === 'prev'
+        ? separator.nextElementSibling
+        : separator.previousElementSibling;
+      if (!targetSection) return firstVisibleListAnchor();
+      const item = direction === 'prev'
+        ? targetSection.querySelector('.item[data-select-event]')
+        : [...targetSection.querySelectorAll('.item[data-select-event]')].pop();
+      if (!item) return firstVisibleListAnchor();
+      const listRect = els.list.getBoundingClientRect();
+      return {
+        eventId: item.dataset.selectEvent,
+        offset: item.getBoundingClientRect().top - listRect.top,
+      };
+    }
     function bindListInteractions() {
-      els.list.querySelectorAll('[data-event]').forEach(item => item.addEventListener('click', () => {
-        selectEvent(item.dataset.event, item.dataset.attachment || '');
+      els.list.querySelectorAll('[data-select-event]').forEach(item => item.addEventListener('click', event => {
+        if (event.target.closest('a, button')) return;
+        selectEvent(item.dataset.selectEvent, item.dataset.attachment || '');
       }));
       els.list.querySelectorAll('[data-attachment]').forEach(item => item.addEventListener('click', () => {
         activeAttachmentId = item.dataset.attachment;
         selectEvent(item.dataset.event, item.dataset.attachment);
       }));
-      els.list.querySelectorAll('[data-expand-gap]').forEach(button => button.addEventListener('click', event => {
+      els.list.querySelectorAll('[data-expand-gap-prev]').forEach(button => button.addEventListener('click', event => {
         event.stopPropagation();
-        const key = button.dataset.expandGap;
+        const anchor = separatorAnchorFromButton(button, 'prev');
+        const key = `${button.dataset.expandGapPrev}:backward`;
         timelineExpansion.set(key, (timelineExpansion.get(key) || 0) + TIMELINE_EXPAND_SIZE);
         renderList();
+        restoreListAnchor(anchor);
+      }));
+      els.list.querySelectorAll('[data-expand-gap-next]').forEach(button => button.addEventListener('click', event => {
+        event.stopPropagation();
+        const anchor = firstVisibleListAnchor();
+        const key = `${button.dataset.expandGapNext}:next`;
+        timelineExpansion.set(key, (timelineExpansion.get(key) || 0) + TIMELINE_EXPAND_SIZE);
+        renderList();
+        restoreListAnchor(anchor);
       }));
       els.list.querySelectorAll('a, button').forEach(control => control.addEventListener('click', event => event.stopPropagation()));
+    }
+    function firstVisibleListAnchor() {
+      const listRect = els.list.getBoundingClientRect();
+      const item = [...els.list.querySelectorAll('.item[data-select-event]')].find(candidate => {
+        const rect = candidate.getBoundingClientRect();
+        return rect.bottom > listRect.top + 4;
+      });
+      return item ? {
+        eventId: item.dataset.selectEvent,
+        offset: item.getBoundingClientRect().top - listRect.top,
+      } : null;
+    }
+    function restoreListAnchor(anchor) {
+      if (!anchor) return;
+      const item = els.list.querySelector(`[data-select-event="${CSS.escape(anchor.eventId)}"]`);
+      if (!item) return;
+      const listRect = els.list.getBoundingClientRect();
+      const rect = item.getBoundingClientRect();
+      els.list.scrollTop += (rect.top - listRect.top) - anchor.offset;
+    }
+    function firstVisibleThreadAnchor() {
+      const container = els.detail.querySelector('.thread-context');
+      if (!container) return null;
+      const containerRect = container.getBoundingClientRect();
+      const item = [...container.querySelectorAll('.item[data-thread-event]')].find(candidate => {
+        const rect = candidate.getBoundingClientRect();
+        return rect.bottom > containerRect.top + 4;
+      });
+      return item ? {
+        eventId: item.dataset.threadEvent,
+        offset: item.getBoundingClientRect().top - containerRect.top,
+      } : null;
+    }
+    function restoreThreadAnchor(anchor) {
+      if (!anchor) return;
+      const container = els.detail.querySelector('.thread-context');
+      if (!container) return;
+      const item = container.querySelector(`[data-thread-event="${CSS.escape(anchor.eventId)}"]`);
+      if (!item) return;
+      const containerRect = container.getBoundingClientRect();
+      const rect = item.getBoundingClientRect();
+      container.scrollTop += (rect.top - containerRect.top) - anchor.offset;
+    }
+    function threadSeparatorAnchorFromButton(button, direction) {
+      const container = els.detail.querySelector('.thread-context');
+      if (!container) return null;
+      const separator = button.closest('.slice-separator');
+      if (!separator) return firstVisibleThreadAnchor();
+      const targetSection = direction === 'prev'
+        ? separator.nextElementSibling
+        : separator.previousElementSibling;
+      if (!targetSection) return firstVisibleThreadAnchor();
+      const item = direction === 'prev'
+        ? targetSection.querySelector('.item[data-thread-event]')
+        : [...targetSection.querySelectorAll('.item[data-thread-event]')].pop();
+      if (!item) return firstVisibleThreadAnchor();
+      const containerRect = container.getBoundingClientRect();
+      return {
+        eventId: item.dataset.threadEvent,
+        offset: item.getBoundingClientRect().top - containerRect.top,
+      };
     }
     function renderList() {
       renderChips();
       if (activeView === 'messages') {
         const rows = filteredMessages().slice(0, 300);
         els.list.innerHTML = rows.map(message => `
-          <article class="item ${message.event_id === activeEventId ? 'active' : ''}" data-event="${escapeHtml(message.event_id)}">
-            <div class="item-title"><span class="summary">${escapeHtml(message.display_summary)}</span><span class="timestamp">${escapeHtml(formatDateTime(message.event_dt_utc))}</span></div>
-            <div class="meta"><strong>${escapeHtml(message.event_id)}</strong><span>${escapeHtml(message.display_sender)}</span>${message.display_recipients ? `<span>to ${escapeHtml(message.display_recipients)}</span>` : ''}</div>
-            <div class="body-preview">${escapeHtml(message.body_preview)}</div>
-            <div class="meta tag-row">${renderBadges(message)}</div>
+          <article class="item message-ledger medium-${isEmailMessage(message) ? 'email' : 'text'} ${directionCss(message)} ${message.event_id === activeEventId ? 'active' : ''}" data-event="${escapeHtml(message.event_id)}" data-select-event="${escapeHtml(message.event_id)}">
+            ${timelineSourceIconHtml(message)}
+            <div class="message-ledger-meta">
+              <div class="message-ledger-identity">${escapeHtml(messageLedgerIdentityText(message))}</div>
+              <div class="message-ledger-right">${!isEmailMessage(message) ? attachmentCountBadge(message.attachment_count || 0) : ''}<span>${escapeHtml(formatShortDateTime(message.event_dt_utc))}</span><span class="message-ledger-id">${escapeHtml(message.event_id)}</span></div>
+            </div>
+            ${isEmailMessage(message) ? `<div class="message-ledger-email-head"><div class="message-ledger-subject">${escapeHtml(message.subject || '[no subject]')}</div><div>${attachmentCountBadge(message.attachment_count || 0)}</div></div>` : ''}
+            <div class="message-ledger-snippet">${escapeHtml(messagePreviewText(message))}</div>
+            ${messageViewBadges(message) ? `<div class="meta tag-row message-ledger-tags">${messageViewBadges(message)}</div>` : ''}
           </article>`).join('');
         if (!rows.length) els.list.innerHTML = '<div class="empty">No messages match the current filters.</div>';
       } else {
-        if (activeView === 'attachments') {
-          const rows = filteredAttachments().slice(0, 300);
-          els.list.innerHTML = rows.map(att => {
-            const sourceMessage = byEvent.get(att.event_id) || {};
-            return `
-            <article class="item ${att.attachment_id === activeAttachmentId ? 'active' : ''}" data-attachment="${escapeHtml(att.attachment_id)}" data-event="${escapeHtml(att.event_id)}">
-              <div class="item-title"><span class="summary">${escapeHtml(att.filename || att.saved_path || att.attachment_id)}</span><span class="timestamp">${escapeHtml(att.attachment_id)}</span></div>
-              <div class="meta"><strong>${escapeHtml(att.exhibit_id || att.attachment_id)}</strong><span>${escapeHtml(formatDateTime(sourceMessage.event_dt_utc || ''))}</span><span>${escapeHtml(formatBytes(att.size_bytes))}</span></div>
-              <div class="body-preview">${escapeHtml(att.filename || att.saved_path || '[unnamed attachment]')}</div>
-              <div class="meta tag-row"><span class="badge attach kind-${safeClass(attachmentKind(att))}">${tagIcon('attach')}${kindLabel(attachmentKind(att))}</span>${att.converted_path ? `<span class="badge kind-image">${tagIcon('attach')}Converted JPG</span>` : ''}${att.exif_dt_utc ? `<span class="badge exif">${tagIcon('exif')}EXIF time</span>` : ''}</div>
-              <div class="row-actions compact-actions">
-                ${att.exhibit_pdf_path ? `<a href="${escapeHtml(att.exhibit_pdf_path)}" target="_blank" rel="noopener">Exhibit PDF</a>` : ''}
-                ${att.preferred_view_path ? `<a href="${escapeHtml(att.preferred_view_path)}" target="_blank" rel="noopener">Preferred</a>` : ''}
-                ${att.bundle_saved_path ? `<a href="${escapeHtml(att.bundle_saved_path)}" target="_blank" rel="noopener">Original</a>` : ''}
-              </div>
-            </article>`;
-          }).join('');
-          if (!rows.length) els.list.innerHTML = '<div class="empty">No attachments match the current filters.</div>';
-        } else {
-          renderTimelineList();
-        }
+        renderTimelineList();
       }
       bindListInteractions();
     }
@@ -2044,7 +2661,7 @@ def render_index(
       const results = message.ai_tag_details || [];
       if (!results.length) return '';
       return `
-        <details open>
+        <details>
           <summary>AI Triage Evidence (${results.length})</summary>
           ${results.map(result => `
             <div class="attachment">
@@ -2068,34 +2685,58 @@ def render_index(
       if (!href) return detailRow(label, '');
       return `<div class="key">${escapeHtml(label)}</div><div class="value"><a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(text || href)}</a></div>`;
     }
-    function bundleSummaryHtml() {
-      const warningCount = Number(manifest.exhibit_generation_warning_count || 0);
+    function detailCard(label, value) {
+      return `<div class="detail-cell"><span class="key">${escapeHtml(label)}</span><div class="value">${escapeHtml(value || '')}</div></div>`;
+    }
+    function bundleSummaryFields() {
+      const warningCount = Number(manifest.render_asset_warning_count || 0);
       const sourceDbName = String(manifest.source_db_path || '').split('/').pop();
+      return [
+        detailCard('bundle built', formatDateTime(manifest.build_timestamp_utc)),
+        detailCard('integrity status', manifest.integrity_status || integrity.status),
+        detailCard('messages', manifest.message_count || messages.length),
+        detailCard('attachments', manifest.attachment_count || attachments.length),
+        detailCard('timeline rows', manifest.timeline_row_count || timeline.length),
+        detailCard('source database', sourceDbName),
+        detailCard('source db SHA-256', manifest.source_db_sha256),
+        detailCard('PDF attachments', manifest.pdf_attachment_count),
+        detailCard('PDFs rasterized', manifest.rendered_pdf_attachment_count),
+        detailCard('rendered PDF pages', manifest.rendered_pdf_page_count),
+        detailCard('inline-printable attachments', manifest.inline_printable_attachment_count),
+        detailCard('metadata-sheet attachments', manifest.non_inline_printable_attachment_count),
+        detailCard('render warnings', warningCount),
+        detailCard('rendered pages location', manifest.rendered_pages_location),
+      ].join('');
+    }
+    function recordMetadataHtml(message) {
       return `
         <details>
-          <summary>Bundle Summary</summary>
-          <div class="detail-grid">
-            ${detailRow('bundle built', formatDateTime(manifest.build_timestamp_utc))}
-            ${detailRow('integrity status', manifest.integrity_status || integrity.status)}
-            ${detailRow('messages', manifest.message_count || messages.length)}
-            ${detailRow('attachments', manifest.attachment_count || attachments.length)}
-            ${detailRow('timeline rows', manifest.timeline_row_count || timeline.length)}
-            ${detailRow('source database', sourceDbName)}
-            ${detailRow('source db SHA-256', manifest.source_db_sha256)}
-            ${detailRow('generated exhibits', manifest.generated_exhibit_pdf_count)}
-            ${detailRow('reused exhibits', manifest.reused_exhibit_pdf_count)}
-            ${detailRow('exhibit warnings', warningCount)}
-            ${linkRow('full packet PDF', manifest.attachment_packet_pdf_path, manifest.attachment_packet_pdf_path)}
+          <summary>Record Metadata</summary>
+          <div class="detail-grid compact">
+            ${detailCard('event_id', message.event_id)}
+            ${detailCard('timestamp', formatDateTime(message.event_dt_utc))}
+            ${detailCard('source', message.source)}
+            ${detailCard('direction', message.direction)}
+            ${detailCard('sender', message.sender)}
+            ${detailCard('recipients', (message.recipients || []).join(', '))}
+            ${detailCard('subject', message.subject)}
+            ${detailCard('source_record_id', message.source_record_id)}
+            ${detailCard('thread_key', message.thread_key)}
+            ${detailCard('recipients_json', message.recipients_json)}
+            ${detailCard('content_hash', message.content_hash)}
+            ${detailCard('source file', message.source_file)}
+            ${bundleSummaryFields()}
           </div>
+          ${aiEvidenceHtml(message)}
         </details>`;
     }
     function attachmentLinks(att) {
       return `
         <div class="row-actions">
-          ${att.exhibit_pdf_path ? `<a href="${escapeHtml(att.exhibit_pdf_path)}" target="_blank" rel="noopener">Open exhibit PDF</a>` : ''}
           ${att.preferred_view_path ? `<a href="${escapeHtml(att.preferred_view_path)}" target="_blank" rel="noopener">Open preferred view</a>` : ''}
           ${att.bundle_saved_path ? `<a href="${escapeHtml(att.bundle_saved_path)}" target="_blank" rel="noopener">Open original</a>` : ''}
           ${att.bundle_converted_path ? `<a href="${escapeHtml(att.bundle_converted_path)}" target="_blank" rel="noopener">Open converted JPG</a>` : ''}
+          ${(att.rendered_page_paths || []).length ? `<a href="${escapeHtml(att.rendered_page_paths[0])}" target="_blank" rel="noopener">Open first rendered page</a>` : ''}
         </div>`;
     }
     function exhibitCoverHtml(att, sourceMessage) {
@@ -2117,11 +2758,19 @@ def render_index(
       const kind = attachmentKind(att);
       const href = att.preferred_view_path || att.bundle_saved_path || '';
       if (!href) return '<div class="attachment-preview"><div class="preview-note">No preview path available.</div></div>';
+      if (kind === 'pdf') {
+        const pages = (att.rendered_page_paths || []).filter(Boolean);
+        if (pages.length) {
+          return `<div class="attachment-preview"><div class="attachment-media-grid">${pages.map((pageHref, index) => `
+            <div>
+              <div class="attachment-media-header">${escapeHtml(att.exhibit_id || att.attachment_id || 'Attachment')} | ${escapeHtml(att.filename || att.saved_path || '')} | page ${index + 1}</div>
+              <img src="${escapeHtml(pageHref)}" alt="${escapeHtml(att.filename || att.attachment_id || 'PDF page')}">
+            </div>`).join('')}</div></div>`;
+        }
+        return `<div class="attachment-preview"><div class="preview-note">${escapeHtml(att.render_asset_warning || 'PDF pages were not rasterized for inline preview. Print or review the original file separately from the bundle.')}</div></div>`;
+      }
       if (kind === 'image' && !String(href).toLowerCase().match(/\\.heics?$/)) {
         return `<div class="attachment-preview"><img src="${escapeHtml(href)}" alt="${escapeHtml(att.filename || att.attachment_id || 'Attachment image')}"></div>`;
-      }
-      if (kind === 'pdf') {
-        return `<div class="attachment-preview"><iframe src="${escapeHtml(href)}" title="${escapeHtml(att.filename || att.attachment_id || 'PDF attachment')}"></iframe></div>`;
       }
       if (kind === 'video') {
         return `<div class="attachment-preview"><video src="${escapeHtml(href)}" controls></video></div>`;
@@ -2129,7 +2778,73 @@ def render_index(
       if (kind === 'audio') {
         return `<div class="attachment-preview"><audio src="${escapeHtml(href)}" controls></audio></div>`;
       }
-      return `<div class="attachment-preview"><div class="preview-note">Inline preview is not available for ${escapeHtml(kindLabel(kind))}. Use the attachment links above.</div></div>`;
+      return `<div class="attachment-preview"><div class="preview-note">${escapeHtml(att.render_asset_warning || `Inline preview is not available for ${kindLabel(kind)}. Use the attachment links above.`)}</div></div>`;
+    }
+    function messageBodyHtml(message) {
+      const recipients = (message.recipients || []).join(', ');
+      const headingHtml = `
+        <div class="message-heading">
+          ${isEmailMessage(message) && message.subject ? `<div class="message-heading-subject">${escapeHtml(message.subject)}</div>` : ''}
+          <div class="message-heading-grid">
+            <div class="message-heading-cell">
+              <span class="key">From</span>
+              <div class="value">${escapeHtml(message.display_sender || message.sender || 'Unknown')}</div>
+            </div>
+            <div class="message-heading-cell">
+              <span class="key">To</span>
+              <div class="value">${escapeHtml(recipients || 'Unknown')}</div>
+            </div>
+            <div class="message-heading-cell">
+              <span class="key">Date / Time</span>
+              <div class="value">${escapeHtml(formatDateTime(message.event_dt_utc) || 'Unknown')}</div>
+            </div>
+          </div>
+        </div>`;
+      const body = messageBodyText(message);
+      const galleryHtml = messageBodyGalleryHtml(message);
+      if (body && galleryHtml) return `${headingHtml}<div class="body-box">${escapeHtml(body)}</div>${galleryHtml}`;
+      if (body) return `${headingHtml}<div class="body-box">${escapeHtml(body)}</div>`;
+      if (galleryHtml) return `${headingHtml}${galleryHtml}`;
+      if (isEmailMessage(message) && message.subject) {
+        return `${headingHtml}<div class="body-box">[subject only]</div>`;
+      }
+      return `${headingHtml}<div class="body-box">[no body]</div>`;
+    }
+    function attachmentMetadataHtml(att, message) {
+      return `
+        <details class="attachment-meta-toggle">
+          <summary>Attachment Metadata</summary>
+          <div class="detail-grid compact attachment-meta">
+            ${detailCard('attachment_id', att.attachment_id)}
+            ${detailCard('exhibit_id', att.exhibit_id)}
+            ${detailCard('linked event_id', att.event_id)}
+            ${detailCard('filename', att.filename || att.saved_path)}
+            ${detailCard('MIME type', att.mime_type)}
+            ${detailCard('size', formatBytes(att.size_bytes))}
+            ${detailCard('EXIF UTC', formatDateTime(att.exif_dt_utc))}
+            ${detailCard('render status', att.render_asset_status)}
+            ${detailCard('render warning', att.render_asset_warning)}
+            ${detailCard('rendered pages', String((att.rendered_page_paths || []).length || 0))}
+            ${detailCard('source file path', att.source_file)}
+            ${detailCard('saved path', att.saved_path)}
+            ${detailCard('converted path', att.converted_path)}
+            ${detailCard('preferred view', att.preferred_view_path)}
+            ${detailCard('sha256_hash', att.sha256_hash)}
+            ${detailCard('EXIF raw', att.exif_dt_raw)}
+            ${detailCard('linked message timestamp', formatDateTime(message.event_dt_utc))}
+          </div>
+        </details>`;
+    }
+    function messageBodyGalleryHtml(message) {
+      const images = previewableImageAttachments(message);
+      if (!images.length) return '';
+      return `
+        <div class="message-gallery">
+          ${images.map(att => `
+            <figure>
+              <img src="${escapeHtml(att.preferred_view_path || att.bundle_saved_path || '')}" alt="${escapeHtml(att.filename || att.attachment_id || 'Message image')}">
+            </figure>`).join('')}
+        </div>`;
     }
     function activeFilterSummary() {
       const rows = [];
@@ -2150,16 +2865,39 @@ def render_index(
         h2 { font: 700 15px/1.25 Arial, sans-serif; margin: 18px 0 8px; border-bottom: 1px solid #999; padding-bottom: 3px; }
         h3 { font: 700 13px/1.25 Arial, sans-serif; margin: 12px 0 6px; }
         .meta { color: #444; font: 11px/1.35 Arial, sans-serif; margin-bottom: 10px; }
-        .message { break-inside: avoid; border-top: 1px solid #bbb; padding-top: 10px; margin-top: 12px; }
+        .message { break-inside: avoid; margin-top: 12px; }
+
+        .message:not(.has-pdf-attachment) { border: 1px solid #bbb; padding: 10px; }
+        .message:not(.has-pdf-attachment).direction-outbound { margin-left: 20%; }
+        .message:not(.has-pdf-attachment).direction-inbound { margin-right: 20%; }
+        .message.has-pdf-attachment { break-inside: auto; page-break-inside: auto; border: 0; padding: 0; }
+        .message.has-pdf-attachment .message-core { border: 1px solid #bbb; padding: 10px; }
+        .message.has-pdf-attachment.direction-outbound .message-core { margin-left: 20%; }
+        .message.has-pdf-attachment.direction-inbound .message-core { margin-right: 20%; }
+
+        .message.direction-inbound .body { background: #ffffff; }
         .grid { display: grid; grid-template-columns: 120px 1fr; gap: 3px 10px; }
+        .message-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 6px; }
+        .message-head .message-label { font: 700 12px/1.25 Arial, sans-serif; text-transform: uppercase; color: #333; }
+        .message-head .message-date { font: 11px/1.25 Arial, sans-serif; color: #444; text-align: right; }
+        .message-core { margin-bottom: 0; }
+        .message.has-pdf-attachment .message-core { break-inside: avoid; page-break-inside: avoid; }
+        .message-identity { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr); gap: 2px 18px; margin: 10px 0 0; padding: 0; width: 100%; max-width: 100%; font: 11px/1.35 Arial, sans-serif; align-items: start; }
+        .message-identity-item { min-width: 0; display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+        .message-identity-label { display: block; color: #666; font: 700 10px/1.2 Arial, sans-serif; text-transform: uppercase; letter-spacing: .03em; text-align: left; }
+        .message-identity-value { overflow-wrap: anywhere; }
+        .message-subject { font: 700 13px/1.3 Arial, sans-serif; margin: 0 0 8px; color: #222; }
+        .message-body-meta { margin-top: 8px; font: 11px/1.35 Arial, sans-serif; color: #444; }
         .key { color: #555; font-family: Arial, sans-serif; }
-        .body { white-space: pre-wrap; border: 1px solid #ccc; padding: 8px; margin-top: 8px; }
+        .body { white-space: pre-wrap; border: 1px solid #ccc; padding: 12px 14px 12px 18px; margin-top: 8px; }
         .citation { font-family: Arial, sans-serif; border-left: 3px solid #555; padding-left: 8px; margin: 8px 0; }
-        .attachment { break-inside: avoid; border: 1px solid #bbb; padding: 8px; margin: 8px 0; }
+        .attachment { break-inside: avoid-page; page-break-inside: avoid; border: 1px solid #bbb; padding: 8px; margin: 8px 0; overflow: hidden; }
+        .message.has-pdf-attachment .attachment-group { break-inside: avoid; page-break-inside: avoid; }
+
         .exhibit-cover { break-inside: avoid; border: 2px solid #222; padding: 14px; margin: 10px 0; text-align: center; }
         .exhibit-cover .exhibit-id { font: 700 28px/1.2 Arial, sans-serif; margin-bottom: 8px; }
         .exhibit-cover .exhibit-meta { font: 12px/1.35 Arial, sans-serif; text-align: left; display: inline-block; max-width: 100%; }
-        .exhibit-image { display: block; max-width: 100%; max-height: 7in; margin: 8px 0; border: 1px solid #999; object-fit: contain; }
+        .exhibit-image { display: block; width: auto; max-width: 100%; height: auto; max-height: 6.5in; margin: 8px auto; border: 1px solid #999; object-fit: contain; }
         .attachment-list { margin: 6px 0 0 18px; padding: 0; }
         .summary-table { width: 100%; max-width: 100%; border-collapse: collapse; margin-top: 12px; table-layout: fixed; }
         .summary-table th, .summary-table td { border: 1px solid #999; padding: 5px 6px; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
@@ -2167,14 +2905,32 @@ def render_index(
         .summary-table td { font-size: 11px; }
         .summary-body { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
         .exhibit-reference { border-left: 3px solid #777; padding-left: 8px; margin: 10px 0; font: 11px/1.4 Arial, sans-serif; color: #333; }
-        .attachment-page { break-before: page; page-break-before: always; page-break-inside: avoid; }
+        .attachment-page { break-before: page; page-break-before: always; break-after: page; page-break-after: always; page-break-inside: avoid; }
         .attachment-page:first-of-type { break-before: auto; page-break-before: auto; }
+        .attachment-page:last-of-type { break-after: auto; page-break-after: auto; }
+        .attachment-media-header { font: 700 11px/1.35 Arial, sans-serif; margin: 0 0 8px; color: #222; }
+        .attachment-media-grid { display: grid; gap: 10px; break-inside: avoid-page; page-break-inside: avoid; }
+        .attachment-media-grid img { display: block; width: auto; max-width: 100%; height: auto; max-height: 6.5in; object-fit: contain; border: 1px solid #999; background: #fff; margin-inline: auto; }
+        .pdf-cover-page { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 9in; }
+        .pdf-cover-title { font: 700 18px/1.25 Arial, sans-serif; margin: 0 0 16px; text-align: center; }
+        .pdf-cover-grid { display: grid; grid-template-columns: max-content max-content; gap: 6px 20px; width: fit-content; max-width: 100%; margin: 0 auto; }
+        .pdf-cover-grid .key { text-align: left; font-weight: 700; }
+        .pdf-cover-grid div:nth-child(2n) { text-align: left; overflow-wrap: anywhere; }
+        .pdf-page-sheet { display: flex; flex-direction: column; min-height: 9in; padding:0; border:none; }
+        .pdf-page-media { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; padding-bottom: 8px; }
+        .pdf-page-media img { display: block; width: auto; max-width: 100%; height: auto; max-height: calc(10.5in - 100px); object-fit: contain; border: 1px solid #999; background: #fff; margin: 0 auto; }
+        .pdf-page-footer { flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; align-items: center; padding-top: 6px; border-top: 1px solid #777; font: 10px/1.2 Arial, sans-serif; color: #222; }
+        .pdf-page-footer div:nth-child(2) { text-align: center; }
+        .pdf-page-footer div:nth-child(3) { text-align: right; }
         body.timeline-print { font-size: 10.5px; }
         body.timeline-print h1 { font-size: 18px; }
         body.timeline-print .meta { font-size: 10px; }
         .timeline-card { break-inside: avoid; border: 1px solid #999; padding: 7px 8px; margin: 7px 0; }
-        .timeline-card h2 { margin: 0 0 4px; border: 0; padding: 0; font-size: 12px; overflow-wrap: anywhere; }
+        .timeline-card-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 6px; font: 700 11px/1.25 Arial, sans-serif; text-transform: uppercase; }
+        .timeline-card-id { display: grid; grid-template-columns: 1.2fr .8fr 1fr; gap: 8px; margin-bottom: 6px; font: 11px/1.35 Arial, sans-serif; }
+        .timeline-card-id div { border: 1px solid #ccc; padding: 5px 6px; }
         .timeline-card .details { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+        .timeline-card .body-meta { margin-top: 8px; font: 11px/1.35 Arial, sans-serif; color: #444; }
         a { color: #111; text-decoration: underline; overflow-wrap: anywhere; }
         .path { overflow-wrap: anywhere; font-family: Arial, sans-serif; font-size: 11px; }
       `;
@@ -2198,34 +2954,103 @@ def render_index(
       const path = String(att.preferred_view_path || att.bundle_saved_path || '').toLowerCase();
       return mime.startsWith('image/') && !path.endsWith('.heic') && !path.endsWith('.heics');
     }
+    function printableAttachmentMediaHtml(att) {
+      const pdfPages = (att.rendered_page_paths || []).filter(Boolean);
+      if (pdfPages.length) {
+        return `
+          <div class="attachment-media-grid">
+            ${pdfPages.map((href, index) => `
+              <div>
+                <div class="attachment-media-header">${escapeHtml(att.exhibit_id || att.attachment_id || 'Attachment')} | ${escapeHtml(att.filename || att.saved_path || '')} | page ${index + 1}</div>
+                <img class="exhibit-image" src="${escapeHtml(href)}" alt="${escapeHtml(att.filename || att.attachment_id || 'PDF page')}">
+              </div>`).join('')}
+          </div>`;
+      }
+      if (isPrintableImage(att) && att.preferred_view_path) {
+        return `
+          <div class="attachment-media-grid">
+            <div>
+              <div class="attachment-media-header">${escapeHtml(att.exhibit_id || att.attachment_id || 'Attachment')} | ${escapeHtml(att.filename || att.saved_path || '')}</div>
+              <img class="exhibit-image" src="${escapeHtml(att.preferred_view_path)}" alt="${escapeHtml(att.filename || att.attachment_id || 'Attachment image')}">
+            </div>
+          </div>`;
+      }
+      return '';
+    }
+    function printAttachmentFallbackHtml(att) {
+      const note = att.render_asset_warning || 'Browser print cannot embed this attachment inline. Review or print the original bundle file separately.';
+      return `
+        <div class="exhibit-reference">
+          <strong>Attachment requires separate handling.</strong><br>
+          ${escapeHtml(note)}
+        </div>`;
+    }
     function printAttachmentReference(att, sourceMessage) {
       return `<li>${escapeHtml(att.exhibit_id || '')} | ${escapeHtml(att.attachment_id)} | ${escapeHtml(att.filename || att.saved_path || '[unnamed attachment]')} | source event ${escapeHtml(att.event_id)} | ${escapeHtml(formatDateTime(sourceMessage?.event_dt_utc || ''))}</li>`;
+    }
+    function printAttachmentReferenceList(rows) {
+      if (!rows.length) return '';
+      return `<ul class="attachment-list">${rows.map(({ message, attachment }) => printAttachmentReference(attachment, message)).join('')}</ul>`;
+    }
+    function printPdfCoverPageHtml(att, sourceMessage, label, level = 'standard') {
+      const fullRows = level === 'full' ? `
+            ${printDetailRow('saved path', att.saved_path)}
+            ${printDetailRow('converted path', att.converted_path)}
+            ${printDetailRow('preferred view', att.preferred_view_path)}
+            ${printDetailRow('EXIF raw', att.exif_dt_raw)}
+            ${printDetailRow('render status', att.render_asset_status)}
+            ${printDetailRow('render warning', att.render_asset_warning)}
+      ` : '';
+      return `
+        <div class="attachment attachment-page pdf-cover-page">
+          <div class="pdf-cover-title">${escapeHtml(label || 'Attachment')} ${escapeHtml(att.exhibit_id || att.attachment_id || '')}</div>
+          <div class="pdf-cover-grid">
+            ${printDetailRow('exhibit_id', att.exhibit_id)}
+            ${printDetailRow('attachment_id', att.attachment_id)}
+            ${printDetailRow('source event_id', att.event_id)}
+            ${printDetailRow('timestamp', formatDateTime(sourceMessage?.event_dt_utc || ''))}
+            ${printDetailRow('filename', att.filename || att.saved_path)}
+            ${printDetailRow('MIME type', att.mime_type)}
+            ${printDetailRow('page count', String((att.rendered_page_paths || []).length || 0))}
+            ${level === 'full' ? printDetailRow('size', formatBytes(att.size_bytes)) : ''}
+            ${level === 'full' ? printDetailRow('EXIF UTC', formatDateTime(att.exif_dt_utc)) : ''}
+            ${level === 'full' ? printDetailRow('sha256_hash', att.sha256_hash) : ''}
+            ${fullRows}
+          </div>
+        </div>`;
     }
     function printAttachmentHtml(att, sourceMessage, label, level = 'standard') {
       if (level === 'summary') {
         return `<ul class="attachment-list">${printAttachmentReference(att, sourceMessage)}</ul>`;
       }
-      const imageHtml = isPrintableImage(att) && att.preferred_view_path
-        ? `<img class="exhibit-image" src="${escapeHtml(att.preferred_view_path)}" alt="${escapeHtml(att.filename || att.attachment_id || 'Attachment image')}">`
-        : '';
-      const exhibitReference = att.exhibit_id || att.attachment_id || 'attachment exhibit';
-      const exhibitReferenceHtml = att.exhibit_pdf_path
-        ? `<p class="exhibit-reference">See exhibit ${escapeHtml(exhibitReference)} in the full packet appendix PDF.</p>`
-        : `<p class="exhibit-reference">Exhibit rendering is unavailable for this attachment in the appendix packet.</p>`;
-      const bodyContent = attachmentKind(att) === 'pdf' && level !== 'full'
-        ? exhibitReferenceHtml
-        : (imageHtml || exhibitReferenceHtml);
+      const pdfPages = (att.rendered_page_paths || []).filter(Boolean);
+      if (pdfPages.length) {
+        const totalPages = pdfPages.length;
+        return `${printPdfCoverPageHtml(att, sourceMessage, label, level)}${pdfPages.map((href, index) => `
+          <div class="attachment attachment-page pdf-page-sheet">
+            <div class="pdf-page-media">
+              <img src="${escapeHtml(href)}" alt="${escapeHtml(att.filename || att.attachment_id || 'PDF page')}">
+            </div>
+            <div class="pdf-page-footer">
+              <div>${escapeHtml(att.exhibit_id || '')}</div>
+              <div>${escapeHtml(`Page ${index + 1} of ${totalPages}`)}</div>
+              <div>${escapeHtml(att.attachment_id || '')}</div>
+            </div>
+          </div>`).join('')}`;
+      }
+      const mediaHtml = printableAttachmentMediaHtml(att);
+      const bodyContent = mediaHtml || printAttachmentFallbackHtml(att);
       const fullRows = level === 'full' ? `
-            ${printDetailRow('exhibit PDF', att.exhibit_pdf_path)}
             ${printDetailRow('saved path', att.saved_path)}
             ${printDetailRow('converted path', att.converted_path)}
             ${printDetailRow('preferred view', att.preferred_view_path)}
             ${printDetailRow('EXIF raw', att.exif_dt_raw)}
+            ${printDetailRow('render status', att.render_asset_status)}
+            ${printDetailRow('render warning', att.render_asset_warning)}
       ` : '';
       return `
         <div class="attachment attachment-page">
           <h3>${escapeHtml(label || 'Attachment')} ${escapeHtml(att.exhibit_id || att.attachment_id || '')}</h3>
-          ${exhibitCoverHtml(att, sourceMessage)}
           ${bodyContent}
           <div class="grid">
             ${printDetailRow('exhibit_id', att.exhibit_id)}
@@ -2234,16 +3059,15 @@ def render_index(
             ${printDetailRow('timestamp', formatDateTime(sourceMessage?.event_dt_utc || ''))}
             ${printDetailRow('filename', att.filename || att.saved_path)}
             ${printDetailRow('MIME type', att.mime_type)}
-            ${printDetailRow('size', formatBytes(att.size_bytes))}
-            ${printDetailRow('EXIF UTC', formatDateTime(att.exif_dt_utc))}
-            ${printDetailRow('sha256_hash', att.sha256_hash)}
+            ${level === 'full' ? printDetailRow('size', formatBytes(att.size_bytes)) : ''}
+            ${level === 'full' ? printDetailRow('EXIF UTC', formatDateTime(att.exif_dt_utc)) : ''}
+            ${level === 'full' ? printDetailRow('sha256_hash', att.sha256_hash) : ''}
             ${fullRows}
           </div>
           ${level === 'full' ? `
             <p class="path">Saved path: ${escapeHtml(att.saved_path || '')}</p>
             ${att.converted_path ? `<p class="path">Converted path: ${escapeHtml(att.converted_path)}</p>` : ''}
             ${att.preferred_view_path ? `<p class="path">Preferred file: <a href="${escapeHtml(att.preferred_view_path)}">${escapeHtml(att.preferred_view_path)}</a></p>` : ''}
-            ${att.exhibit_pdf_path ? `<p class="path">Exhibit PDF: <a href="${escapeHtml(att.exhibit_pdf_path)}">${escapeHtml(att.exhibit_pdf_path)}</a></p>` : ''}
             ${att.bundle_saved_path ? `<p class="path">Original file: <a href="${escapeHtml(att.bundle_saved_path)}">${escapeHtml(att.bundle_saved_path)}</a></p>` : ''}
             ${att.bundle_converted_path ? `<p class="path">Converted JPG: <a href="${escapeHtml(att.bundle_converted_path)}">${escapeHtml(att.bundle_converted_path)}</a></p>` : ''}
           ` : ''}
@@ -2252,33 +3076,60 @@ def render_index(
     function printMessageHtml(message, options = {}) {
       const level = options.level || 'standard';
       const directAttachments = message.attachments || [];
+      const directAttachmentRows = directAttachments.map(attachment => ({ message, attachment }));
       const nearbySource = options.includeNearby ? nearbyConversationAttachmentEntries(message, true) : [];
       const nearbyAttachments = level === 'full' ? nearbySource : nearbySource.slice(0, CONVERSATION_ATTACHMENT_LIMIT);
+      const subjectLine = isEmailMessage(message) && message.subject
+        ? `<div class="message-subject">${escapeHtml(message.subject)}</div>`
+        : '';
       const bodyHtml = level === 'summary'
         ? ''
-        : `<div class="body">${escapeHtml(message.body_clean || '[no body]')}</div>`;
+        : `<div class="body">${escapeHtml(message.body_clean || (isEmailMessage(message) && message.subject ? '[subject only]' : '[no body]'))}</div>`;
       const fullRows = level === 'full' ? `
             ${printDetailRow('source_record_id', message.source_record_id)}
             ${printDetailRow('thread_key', message.thread_key)}
             ${printDetailRow('recipients_json', message.recipients_json)}
       ` : '';
+      const printDirectionClass = safeClass(message.direction).includes('out') ? 'direction-outbound' : 'direction-inbound';
+      const hasPdfAttachmentClass = (
+        directAttachments.some(att => attachmentKind(att) === 'pdf')
+        || nearbyAttachments.some(row => attachmentKind(row.attachment) === 'pdf')
+      ) ? 'has-pdf-attachment' : '';
+      const directAttachmentIntro = directAttachments.length
+        ? `<div class="attachment-group"><h3>Message Attachments (${directAttachments.length})</h3>${printAttachmentReferenceList(directAttachmentRows)}</div>`
+        : '';
+      const directAttachmentPages = directAttachments.length
+        ? `<div class="attachment-group">${directAttachments.map(att => printAttachmentHtml(att, message, 'Message Attachment', level)).join('')}</div>`
+        : '';
+      const nearbyAttachmentHeading = `Nearby Conversation Attachments (${nearbyAttachments.length}${nearbySource.length > nearbyAttachments.length ? ` of ${nearbySource.length}` : ''}, +/- ${CONVERSATION_ATTACHMENT_WINDOW_HOURS}h)`;
+      const nearbyAttachmentIntro = options.includeNearby && nearbyAttachments.length
+        ? `<div class="attachment-group"><h3>${nearbyAttachmentHeading}</h3>${printAttachmentReferenceList(nearbyAttachments)}</div>`
+        : '';
+      const nearbyAttachmentPages = options.includeNearby && nearbyAttachments.length
+        ? `<div class="attachment-group">${nearbyAttachments.map(({ message: sourceMessage, attachment: att }) => printAttachmentHtml(att, sourceMessage, sourceMessage.event_id === message.event_id ? 'Current Message Attachment' : 'Nearby Attachment', level)).join('')}</div>`
+        : '';
       return `
-        <section class="message">
-          <h2>${escapeHtml(message.event_id)} | ${escapeHtml(formatDateTime(message.event_dt_utc))}</h2>
-          <div class="grid">
-            ${printDetailRow('event_id', message.event_id)}
-            ${printDetailRow('timestamp', formatDateTime(message.event_dt_utc))}
-            ${printDetailRow('source', message.source)}
-            ${printDetailRow('direction', message.direction)}
-            ${printDetailRow('sender', message.sender)}
-            ${printDetailRow('recipients', (message.recipients || []).join(', '))}
-            ${printDetailRow('subject', message.subject)}
-            ${fullRows}
+        <section class="message ${printDirectionClass} ${hasPdfAttachmentClass}">
+          <div class="message-core">
+            <div class="message-head">
+              <div class="message-label">${escapeHtml(message.direction || 'message')}</div>
+              <div class="message-date">${escapeHtml(formatDateTime(message.event_dt_utc))}</div>
+            </div>
+            ${subjectLine}
+            ${bodyHtml}
+            <div class="message-identity">
+              <div class="message-identity-item"><span class="message-identity-label">Sender</span><div class="message-identity-value">${escapeHtml(message.sender)}</div></div>
+              <div class="message-identity-item"><span class="message-identity-label">Source</span><div class="message-identity-value">${escapeHtml(message.source)}</div></div>
+              <div class="message-identity-item"><span class="message-identity-label">Recipient</span><div class="message-identity-value">${escapeHtml((message.recipients || []).join(', ') || 'Unknown')}</div></div>
+              <div class="message-identity-item"><span class="message-identity-label">ID</span><div class="message-identity-value">${escapeHtml(message.event_id)}</div></div>
+            </div>
+            ${printAiEvidenceHtml(message)}
+            ${directAttachmentIntro}
+            ${nearbyAttachmentIntro}
           </div>
-          ${bodyHtml}
-          ${printAiEvidenceHtml(message)}
-          ${directAttachments.length ? `<h3>Message Attachments (${directAttachments.length})</h3>${directAttachments.map(att => printAttachmentHtml(att, message, 'Message Attachment', level)).join('')}` : ''}
-          ${options.includeNearby && nearbyAttachments.length ? `<h3>Nearby Conversation Attachments (${nearbyAttachments.length}${nearbySource.length > nearbyAttachments.length ? ` of ${nearbySource.length}` : ''}, +/- ${CONVERSATION_ATTACHMENT_WINDOW_HOURS}h)</h3>${nearbyAttachments.map(({ message: sourceMessage, attachment: att }) => printAttachmentHtml(att, sourceMessage, sourceMessage.event_id === message.event_id ? 'Current Message Attachment' : 'Nearby Attachment', level)).join('')}` : ''}
+          ${directAttachmentPages}
+          ${nearbyAttachmentPages}
+          ${level === 'full' ? `<div class="grid">${fullRows}</div>` : ''}
         </section>`;
     }
     function printSummaryAttachmentText(message) {
@@ -2300,16 +3151,16 @@ def render_index(
         <table class="summary-table">
           <thead>
             <tr>
-              <th style="width:18%;">Date</th>
-              <th style="width:20%;">Sender</th>
+              <th style="width:10%;">Date</th>
+              <th style="width:25%;">Sender</th>
               <th>Snippet</th>
-              <th style="width:20%;">Exhibit</th>
+              <th style="width:10%;">Exhibit</th>
             </tr>
           </thead>
           <tbody>
             ${messagesForPrint.map(message => `
               <tr>
-                <td>${escapeHtml(formatDateTime(message.event_dt_utc))}<br>${escapeHtml(message.event_id)}</td>
+                <td>${escapeHtml(formatDateOnly(String(message.event_dt_utc || '').slice(0, 10)))}<br>${escapeHtml(formatShortDateTime(message.event_dt_utc).split(', ').slice(1).join(', '))}<br>${escapeHtml(message.event_id)}</td>
                 <td class="summary-body">${escapeHtml(message.display_sender || message.sender || '')}</td>
                 <td class="summary-body">${escapeHtml(printSummarySnippet(message))}</td>
                 <td class="summary-body">${escapeHtml(printSummaryExhibitText(message))}</td>
@@ -2319,25 +3170,9 @@ def render_index(
     }
     function printSummaryAppendix(messagesForPrint) {
       const rows = messagesForPrint
-        .filter(message => (message.attachments || []).length)
-        .map(message => `
-          <tr>
-            <td>${escapeHtml(formatDateTime(message.event_dt_utc))}<br>${escapeHtml(message.event_id)}</td>
-            <td class="summary-body">${escapeHtml(printSummaryAttachmentText(message))}</td>
-          </tr>`)
-        .join('');
-      if (!rows) return '';
-      return `
-        <h2>Attachment Appendix</h2>
-        <table class="summary-table">
-          <thead>
-            <tr>
-              <th style="width:24%;">Record</th>
-              <th>Attachment References</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>`;
+        .flatMap(message => (message.attachments || []).map(attachment => ({ message, attachment })));
+      if (!rows.length) return '';
+      return `<h2>Attachment Appendix</h2>${rows.map(({ message, attachment }) => printAttachmentHtml(attachment, message, 'Attachment Exhibit', 'standard')).join('')}`;
     }
     function printAttachmentSummaryTable(rows) {
       return `
@@ -2367,8 +3202,10 @@ def render_index(
     }
     function timelineResultRows() {
       const allowedEvents = new Set(filteredMessages().map(message => message.event_id));
+      const emailEvents = new Set(messages.filter(message => isEmailMessage(message)).map(message => message.event_id));
       return timeline
         .filter(row => allowedEvents.has(row.event_id))
+        .filter(row => !(row.attachment_id && emailEvents.has(row.event_id)))
         .slice()
         .sort((a, b) => String(a.timeline_dt_utc || '').localeCompare(String(b.timeline_dt_utc || '')) || String(a.event_id || '').localeCompare(String(b.event_id || '')) || String(a.attachment_id || '').localeCompare(String(b.attachment_id || '')));
     }
@@ -2377,19 +3214,24 @@ def render_index(
         ${rows.map(row => {
           const message = byEvent.get(row.event_id) || {};
           const attachment = row.attachment_id ? byAttachment.get(row.attachment_id) : null;
-          const recordText = [row.event_id, row.attachment_id, attachment?.exhibit_id].filter(Boolean).join(' | ');
+          const recordId = [row.event_id, row.attachment_id || attachment?.exhibit_id].filter(Boolean).join(' | ');
           const details = [
             row.description || '',
             attachment ? `Attachment: ${attachment.filename || '[unnamed attachment]'}` : '',
-            `Source: ${[row.source, row.direction].filter(Boolean).join(' / ')}`,
-            `Sender: ${row.sender || message.display_sender || message.sender || ''}`,
-            row.metadata_status ? `Metadata: ${row.metadata_status}` : '',
           ].filter(Boolean).join('\\n');
           return `
             <section class="timeline-card">
-              <h2>${escapeHtml(formatDateTime(row.timeline_dt_utc))} | ${escapeHtml(row.source_label || 'timeline')}</h2>
-              <p class="meta">${escapeHtml(recordText)}</p>
+              <div class="timeline-card-head">
+                <div>${escapeHtml(row.source_label || 'timeline')}</div>
+                <div>${escapeHtml(formatDateTime(row.timeline_dt_utc))}</div>
+              </div>
+              <div class="timeline-card-id">
+                <div><strong>ID:</strong> ${escapeHtml(recordId)}</div>
+                <div><strong>Source:</strong> ${escapeHtml([row.source, row.direction].filter(Boolean).join(' / '))}</div>
+                <div><strong>Sender:</strong> ${escapeHtml(row.sender || message.display_sender || message.sender || '')}</div>
+              </div>
               <div class="details">${escapeHtml(details)}</div>
+              <div class="body-meta">${escapeHtml(attachment?.exhibit_id ? `Exhibit: ${attachment.exhibit_id}` : '')}</div>
             </section>`;
         }).join('')}`;
     }
@@ -2405,7 +3247,7 @@ def render_index(
               <th style="width:13%;">Type</th>
               <th style="width:12%;">Size</th>
               <th style="width:16%;">Linked Message</th>
-              ${includeFull ? '<th style="width:18%;">Printable File</th>' : ''}
+              ${includeFull ? '<th style="width:18%;">Print Status</th>' : ''}
             </tr>
           </thead>
           <tbody>
@@ -2424,7 +3266,10 @@ def render_index(
                   <td>${escapeHtml(kindLabel(attachmentKind(attachment)))}</td>
                   <td>${escapeHtml(formatBytes(attachment.size_bytes))}</td>
                   <td class="summary-body">${escapeHtml(eventText)}</td>
-                  ${includeFull ? `<td class="summary-body">${attachment.exhibit_pdf_path ? `<a href="${escapeHtml(attachment.exhibit_pdf_path)}">${escapeHtml(attachment.exhibit_pdf_path)}</a>` : ''}</td>` : ''}
+                  ${includeFull ? `<td class="summary-body">${escapeHtml([
+                    attachment.render_asset_status || '',
+                    attachment.render_asset_warning || '',
+                  ].filter(Boolean).join('\\n'))}</td>` : ''}
                 </tr>`;
             }).join('')}
           </tbody>
@@ -2456,14 +3301,14 @@ def render_index(
       printWindow.document.close();
     }
     function printSelectedDetail() {
-      const level = els.printLevel.value || 'standard';
+      const level = 'standard';
       if (activeView === 'attachments') {
         const attachment = byAttachment.get(activeAttachmentId);
         if (!attachment) return;
         const message = byEvent.get(attachment.event_id) || {};
         openPrintDocument(`Attachment ${attachment.attachment_id}`, `
           <h1>Attorney Review Exhibit - Attachment Detail</h1>
-          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: ${escapeHtml(level)}</p>
+          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
           ${printAttachmentHtml(attachment, message, 'Selected Attachment', level)}
           <h2>Linked Message</h2>
           ${printMessageHtml(message, { level })}
@@ -2474,28 +3319,32 @@ def render_index(
       if (!message) return;
       openPrintDocument(`Message ${message.event_id}`, `
         <h1>Attorney Review Exhibit - Message Detail</h1>
-        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: ${escapeHtml(level)}</p>
-        ${printMessageHtml(message, { includeNearby: true, level })}
+        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
+        ${printMessageHtml(message, { includeNearby: false, level })}
       `);
     }
     function printCurrentResults() {
-      const level = els.printLevel.value || 'standard';
+      const level = 'standard';
       if (activeView === 'timeline') {
-        const rows = timelineResultRows();
+        const rows = visibleTimelineMessages()
+          .filter((message, index, all) => all.findIndex(candidate => candidate.event_id === message.event_id) === index)
+          .sort((a, b) => String(a.event_dt_utc || '').localeCompare(String(b.event_dt_utc || '')) || String(a.event_id || '').localeCompare(String(b.event_id || '')));
+        const appendixRows = rows.flatMap(message => (message.attachments || []).map(attachment => ({ message, attachment })));
         openPrintDocument('Attorney Review Timeline Results', `
           <h1>Attorney Review Exhibit - Chronological Timeline</h1>
-          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: ${escapeHtml(level)}</p>
+          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
           <p class="meta">${escapeHtml(activeFilterSummary())}</p>
-          <p class="meta">${rows.length} timeline rows from ${filteredMessages().length} filtered messages</p>
-          ${rows.length ? printTimelineTable(rows) : '<p>No timeline rows match the current filters.</p>'}
-        `, { bodyClass: 'timeline-print' });
+          <p class="meta">${rows.length} messages in the visible timeline slice</p>
+          ${rows.length ? rows.map(message => printMessageHtml(message, { level })).join('') : '<p>No timeline rows match the current filters.</p>'}
+          ${appendixRows.length ? `<h2>Attachment Appendix</h2>${appendixRows.map(({ message, attachment }) => printAttachmentHtml(attachment, message, 'Attachment Exhibit', level)).join('')}` : ''}
+        `);
         return;
       }
       if (activeView === 'attachments') {
         const rows = filteredAttachmentEntries();
         openPrintDocument('Attorney Review Attachment Manifest', `
           <h1>Attorney Review Exhibit - Attachment Manifest</h1>
-          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: ${escapeHtml(level)}</p>
+          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
           <p class="meta">${escapeHtml(activeFilterSummary())}</p>
           <p class="meta">${rows.length} attachments from ${filteredMessages().length} filtered messages</p>
           ${rows.length ? printAttachmentManifestTable(rows, level) : '<p>No attachments match the current filters.</p>'}
@@ -2504,12 +3353,14 @@ def render_index(
       }
       const rows = filteredMessages().slice().sort((a, b) => String(a.event_dt_utc || '').localeCompare(String(b.event_dt_utc || '')) || String(a.event_id || '').localeCompare(String(b.event_id || '')));
       const attachmentCount = rows.reduce((count, message) => count + (message.attachments || []).length, 0);
+      const appendixRows = rows.flatMap(message => (message.attachments || []).map(attachment => ({ message, attachment })));
       openPrintDocument('Attorney Review Search Results', `
         <h1>Attorney Review Exhibit - Chronological History</h1>
-        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: ${escapeHtml(level)}</p>
+        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
         <p class="meta">${escapeHtml(activeFilterSummary())}</p>
         <p class="meta">${rows.length} messages | ${attachmentCount} direct attachments</p>
-        ${level === 'summary' ? printSummaryTable(rows) : rows.map(message => printMessageHtml(message, { level })).join('')}
+        ${rows.map(message => printMessageHtml(message, { level })).join('')}
+        ${appendixRows.length ? `<h2>Attachment Appendix</h2>${appendixRows.map(({ message, attachment }) => printAttachmentHtml(attachment, message, 'Attachment Exhibit', level)).join('')}` : ''}
       `);
     }
     function printSummaryResults() {
@@ -2517,7 +3368,7 @@ def render_index(
         const rows = filteredAttachmentEntries();
         openPrintDocument('Attorney Review Attachment Summary', `
           <h1>Attorney Review Exhibit - Attachment Summary</h1>
-          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: summary</p>
+          <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
           <p class="meta">${escapeHtml(activeFilterSummary())}</p>
           <p class="meta">${rows.length} attachments from ${filteredMessages().length} filtered messages</p>
           ${rows.length ? printAttachmentSummaryTable(rows) : '<p>No attachments match the current filters.</p>'}
@@ -2533,12 +3384,29 @@ def render_index(
       const summaryLabel = activeView === 'timeline' ? 'filtered timeline messages' : 'filtered messages';
       openPrintDocument('Attorney Review Summary', `
         <h1>${escapeHtml(title)}</h1>
-        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: summary</p>
+        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
         <p class="meta">${escapeHtml(activeFilterSummary())}</p>
         <p class="meta">${rows.length} ${escapeHtml(summaryLabel)}</p>
         ${rows.length ? printSummaryTable(rows) : '<p>No messages match the current filters.</p>'}
         ${rows.length ? printSummaryAppendix(rows) : ''}
       `);
+    }
+    function updatePrintMenuLabels() {
+      if (activeView === 'timeline') {
+        els.printCurrent.textContent = 'Print Current Message';
+        els.printResults.textContent = 'Print Visible Timeline';
+        els.printSummary.textContent = 'Print Timeline Summary';
+        return;
+      }
+      if (activeView === 'attachments') {
+        els.printCurrent.textContent = 'Print Current Attachment';
+        els.printResults.textContent = 'Print Attachment Manifest';
+        els.printSummary.textContent = 'Print Attachment Summary';
+        return;
+      }
+      els.printCurrent.textContent = 'Print Current Message';
+      els.printResults.textContent = 'Print Search Results';
+      els.printSummary.textContent = 'Print Search Summary';
     }
     function filteredMessageAttachments() {
       const seen = new Set();
@@ -2554,244 +3422,232 @@ def render_index(
         })
         .sort((a, b) => String(a.message.event_dt_utc || '').localeCompare(String(b.message.event_dt_utc || '')) || String(a.attachment.attachment_id || '').localeCompare(String(b.attachment.attachment_id || '')));
     }
-    function printCurrentAttachments() {
-      const level = els.printLevel.value || 'standard';
-      const rows = activeView === 'attachments' ? filteredAttachmentEntries() : filteredMessageAttachments();
-      openPrintDocument('Attorney Review Attachment Packet', `
-        <h1>Attorney Review Exhibit - Attachment Packet</h1>
-        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))} | Integrity: ${escapeHtml(integrity.status)} | Detail: ${escapeHtml(level)}</p>
-        <p class="meta">${escapeHtml(activeFilterSummary())}</p>
-        <p class="meta">${rows.length} attachments from ${filteredMessages().length} filtered messages</p>
-        ${rows.length ? rows.map(({ message, attachment }) => printAttachmentHtml(attachment, message, 'Attachment Exhibit', level)).join('') : '<p>No attachments match the current filters.</p>'}
+    function printFullPacket() {
+      const level = 'standard';
+      const rows = messages
+        .slice()
+        .sort((a, b) => String(a.event_dt_utc || '').localeCompare(String(b.event_dt_utc || '')) || String(a.event_id || '').localeCompare(String(b.event_id || '')));
+      const attachmentRows = rows
+        .flatMap(message => (message.attachments || []).map(attachment => ({ message, attachment })))
+        .sort((a, b) => String(a.message.event_dt_utc || '').localeCompare(String(b.message.event_dt_utc || '')) || String(a.attachment.attachment_id || '').localeCompare(String(b.attachment.attachment_id || '')));
+      openPrintDocument('Attorney Review Full Packet', `
+        <h1>Attorney Review Exhibit - Full Packet</h1>
+        <p class="meta">Generated ${escapeHtml(formatDateTime(new Date().toISOString()))}</p>
+        <p class="meta">All records in the bundle. Current search filters are not applied.</p>
+        <p class="meta">${rows.length} messages | ${attachmentRows.length} appendix attachments</p>
+        ${rows.length ? rows.map(message => printMessageHtml(message, { level })).join('') : '<p>No messages match the current filters.</p>'}
+        ${attachmentRows.length ? `<h2>Attachment Appendix</h2>${attachmentRows.map(({ message, attachment }) => printAttachmentHtml(attachment, message, 'Attachment Exhibit', level)).join('')}` : ''}
       `);
     }
-    function threadContextHtml(message) {
-      const threadRows = byThread.get(message.thread_key || message.event_id) || [message];
-      const index = threadRows.findIndex(row => row.event_id === message.event_id);
-      const start = Math.max(0, index - 3);
-      const end = Math.min(threadRows.length, index + 4);
-      const rows = threadRows.slice(start, end);
-      return `
-        <details>
-          <summary>Thread Context (${threadRows.length} records)</summary>
-          <div class="thread-context">
-            ${rows.map(row => `
-              <article class="attachment">
-                <div class="detail-grid">
-                  ${detailRow(row.event_id === message.event_id ? 'current event_id' : 'event_id', row.event_id)}
-                  ${detailRow('timestamp', formatDateTime(row.event_dt_utc))}
-                  ${detailRow('direction', row.direction)}
-                  ${detailRow('sender', row.display_sender || row.sender)}
-                  ${detailRow('preview', row.body_preview || row.display_summary)}
-                </div>
-                ${row.event_id === message.event_id ? '<p class="muted">Current message</p>' : `<p><button type="button" data-select-context="${escapeHtml(row.event_id)}">View Message</button></p>`}
-                <div class="meta tag-row context-tags">${renderBadges(row)}</div>
-              </article>`).join('')}
-          </div>
-        </details>`;
+    function sortMessagesChronologically(rows) {
+      return rows
+        .slice()
+        .sort((a, b) => String(a.event_dt_utc || '').localeCompare(String(b.event_dt_utc || '')) || String(a.event_id || '').localeCompare(String(b.event_id || '')));
     }
-    function conversationAttachmentsHtml(message) {
-      const nearbyRows = nearbyConversationAttachmentEntries(message, true);
-      const rows = nearbyRows.slice(0, CONVERSATION_ATTACHMENT_LIMIT);
-      const hiddenCount = Math.max(0, nearbyRows.length - rows.length);
+    function emailThreadRows(message) {
+      const graphNeighbors = emailGraph.get(message.event_id) || new Set();
+      if (graphNeighbors.size) {
+        const visited = new Set([message.event_id]);
+        const queue = [message.event_id];
+        while (queue.length) {
+          const current = queue.shift();
+          for (const neighbor of emailGraph.get(current) || []) {
+            if (visited.has(neighbor)) continue;
+            visited.add(neighbor);
+            queue.push(neighbor);
+          }
+        }
+        const graphRows = [...visited]
+          .map(eventId => byEvent.get(eventId))
+          .filter(Boolean);
+        if (graphRows.length > 1) return sortMessagesChronologically(graphRows);
+      }
+
+      const exactRows = byThread.get(message.thread_key || message.event_id) || [];
+      if (exactRows.length > 1) return sortMessagesChronologically(exactRows);
+
+      const normalizedSubject = normalizedEmailSubject(message.subject);
+      if (normalizedSubject) {
+        const fallbackKey = `${conversationKey(message)}||${normalizedSubject}`;
+        const fallbackRows = emailFallbackBySubjectConversation.get(fallbackKey) || [];
+        if (fallbackRows.length > 1) return sortMessagesChronologically(fallbackRows);
+      }
+
+      return [message];
+    }
+    function threadContextSlices(threadRows, currentEventId) {
+      const currentIndex = threadRows.findIndex(row => row.event_id === currentEventId);
+      if (currentIndex === -1) {
+        return { rows: [byEvent.get(currentEventId)].filter(Boolean), currentIndex: -1 };
+      }
+      const start = Math.max(0, currentIndex - TIMELINE_CONTEXT_SIZE);
+      const end = Math.min(threadRows.length - 1, currentIndex + TIMELINE_CONTEXT_SIZE);
+      const threadKey = `thread:${currentEventId}`;
+      const beforeExpansion = threadContextExpansion.get(`${threadKey}:before`) || 0;
+      const afterExpansion = threadContextExpansion.get(`${threadKey}:after`) || 0;
+      const visibleStart = Math.max(0, start - beforeExpansion);
+      const visibleEnd = Math.min(threadRows.length - 1, end + afterExpansion);
+      return {
+        currentIndex,
+        start,
+        end,
+        visibleStart,
+        visibleEnd,
+        rows: threadRows.slice(visibleStart, visibleEnd + 1),
+        hiddenBefore: visibleStart,
+        hiddenAfter: (threadRows.length - 1) - visibleEnd,
+        threadKey,
+      };
+    }
+    function threadContextNote(message) {
+      const text = isEmailMessage(message)
+        ? 'Shows this email thread only, based on Message-ID, In-Reply-To, or a cautious subject fallback. Nearby messages in the global Timeline may not appear here.'
+        : 'Shows this text thread only, based on the imported conversation thread. Nearby messages in the global Timeline may not appear here.';
+      return `<div class="thread-context-note"><span class="thread-context-note-icon" aria-hidden="true">i</span><div><strong>Thread-local view.</strong> ${escapeHtml(text)}</div></div>`;
+    }
+    function threadContextHtml(message, isOpen = false) {
+      const threadRows = isEmailMessage(message)
+        ? emailThreadRows(message)
+        : (byThread.get(message.thread_key || message.event_id) || [message]);
+      const context = threadContextSlices(threadRows, message.event_id);
+      const rows = context.rows || [message];
+      const showThreadNav = threadRows.length > 1;
       return `
-        <details>
-          <summary>Nearby Conversation Attachments (${rows.length}${hiddenCount ? ` of ${nearbyRows.length}` : ''}, +/- ${CONVERSATION_ATTACHMENT_WINDOW_HOURS}h)</summary>
-          ${hiddenCount ? `<p class="muted">${hiddenCount} more nearby attachments are hidden here. Use Attachments mode for the full manifest.</p>` : ''}
-          ${rows.length ? rows.map(({ message: sourceMessage, attachment: att }) => `
-            <div class="attachment">
-              <div class="detail-grid">
-                ${detailRow('attachment_id', att.attachment_id)}
-                ${detailRow('exhibit_id', att.exhibit_id)}
-                ${detailRow('source event_id', att.event_id)}
-                ${detailRow('timestamp', formatDateTime(sourceMessage.event_dt_utc))}
-                ${detailRow('filename', att.filename || att.saved_path)}
-                ${detailRow('MIME type', att.mime_type)}
-                ${detailRow('size', formatBytes(att.size_bytes))}
-                ${detailRow('EXIF UTC', formatDateTime(att.exif_dt_utc))}
-              </div>
-              <div class="row-actions">
-                ${att.exhibit_pdf_path ? `<a href="${escapeHtml(att.exhibit_pdf_path)}" target="_blank" rel="noopener">Open exhibit PDF</a>` : ''}
-                ${att.preferred_view_path ? `<a href="${escapeHtml(att.preferred_view_path)}" target="_blank" rel="noopener">Open preferred view</a>` : ''}
-                ${att.bundle_saved_path ? `<a href="${escapeHtml(att.bundle_saved_path)}" target="_blank" rel="noopener">Open original</a>` : ''}
-                ${att.bundle_converted_path ? `<a href="${escapeHtml(att.bundle_converted_path)}" target="_blank" rel="noopener">Open converted JPG</a>` : ''}
-                ${sourceMessage.event_id === message.event_id ? '<span class="badge context">Current message</span>' : `<button type="button" data-select-context="${escapeHtml(sourceMessage.event_id)}">Select source message</button>`}
-              </div>
-              ${exhibitCoverHtml(att, sourceMessage)}
-              ${attachmentPreviewHtml(att)}
-            </div>`).join('') : '<p>No attachments found in this conversation.</p>'}
+        <details ${isOpen ? 'open' : ''}>
+          <summary>Thread Context</summary>
+          <div class="thread-context">
+            ${threadContextNote(message)}
+            ${showThreadNav ? `
+              <div class="thread-context-nav"><button type="button" data-thread-expand-prev="${escapeHtml(context.threadKey)}" ${context.hiddenBefore ? '' : 'disabled'}>Previous ${TIMELINE_EXPAND_SIZE}</button></div>` : ''}
+            <section class="timeline-slice">
+              ${rows.map(row => timelineRowHtml(row, row.event_id === message.event_id, 'Current Message').replace('data-select-event=', 'data-thread-event=')).join('')}
+            </section>
+            ${showThreadNav ? `
+              <div class="thread-context-nav"><button type="button" data-thread-expand-next-after="${escapeHtml(context.threadKey)}" ${context.hiddenAfter ? '' : 'disabled'}>Next ${TIMELINE_EXPAND_SIZE}</button></div>` : ''}
+          </div>
         </details>`;
     }
     function renderAttachmentDetail(att) {
       const message = byEvent.get(att.event_id) || {};
       els.detail.innerHTML = `
+        <div class="detail-header">
         <h2>${escapeHtml(att.attachment_id)} Attachment</h2>
-        <p><button id="printDetail" type="button">Print Detail</button></p>
-        ${bundleSummaryHtml()}
-        <div class="detail-grid">
-          ${detailRow('attachment_id', att.attachment_id)}
-          ${detailRow('exhibit_id', att.exhibit_id)}
-          ${detailRow('linked event_id', att.event_id)}
-          ${detailRow('filename', att.filename)}
-          ${detailRow('MIME type', att.mime_type)}
-          ${detailRow('size', formatBytes(att.size_bytes))}
-          ${detailRow('EXIF UTC', formatDateTime(att.exif_dt_utc))}
-        </div>
+      </div>
+      ${attachmentMetadataHtml(att, message)}
         <p><button id="selectSourceMessage" type="button">Select source message</button></p>
         ${attachmentLinks(att)}
         ${exhibitCoverHtml(att, message)}
         ${attachmentPreviewHtml(att)}
         <details>
-          <summary>Metadata</summary>
-          <div class="detail-grid">
-            ${detailRow('source file path', att.source_file)}
-            ${detailRow('exhibit_id', att.exhibit_id)}
-            ${linkRow('exhibit PDF', att.exhibit_pdf_path, att.exhibit_pdf_path)}
-            ${detailRow('exhibit status', att.exhibit_status)}
-            ${detailRow('exhibit warning', att.exhibit_warning)}
-            ${detailRow('saved path', att.saved_path)}
-            ${detailRow('converted path', att.converted_path)}
-            ${detailRow('preferred view', att.preferred_view_path)}
-            ${detailRow('size_bytes', att.size_bytes)}
-            ${detailRow('sha256_hash', att.sha256_hash)}
-            ${detailRow('EXIF raw', att.exif_dt_raw)}
-            ${detailRow('linked message event_id', message.event_id)}
-            ${detailRow('linked message timestamp', formatDateTime(message.event_dt_utc))}
-            ${detailRow('linked message source', message.source)}
-            ${detailRow('linked message direction', message.direction)}
-            ${detailRow('linked message sender', message.sender)}
-            ${detailRow('linked message recipients', (message.recipients || []).join(', '))}
-            ${detailRow('linked message subject', message.subject)}
+          <summary>Record Metadata</summary>
+          <div class="detail-grid compact">
+            ${detailCard('linked message event_id', message.event_id)}
+            ${detailCard('linked message timestamp', formatDateTime(message.event_dt_utc))}
+            ${detailCard('linked message source', message.source)}
+            ${detailCard('linked message direction', message.direction)}
+            ${detailCard('linked message sender', message.sender)}
+            ${detailCard('linked message recipients', (message.recipients || []).join(', '))}
+            ${detailCard('linked message subject', message.subject)}
+            ${bundleSummaryFields()}
           </div>
         </details>
       `;
       document.getElementById('selectSourceMessage').addEventListener('click', () => {
         activeEventId = att.event_id;
-        activeView = 'messages';
+        activeView = 'timeline';
         render();
       });
-      document.getElementById('printDetail').addEventListener('click', printSelectedDetail);
     }
     function renderDetail() {
-      if (activeView === 'attachments') {
-        const visibleAttachments = filteredAttachments();
-        const attachment = visibleAttachments.find(att => att.attachment_id === activeAttachmentId) || visibleAttachments[0];
-        if (!attachment) {
-          els.detail.innerHTML = '<h2>No attachments</h2>';
-          return;
-        }
-        activeAttachmentId = attachment.attachment_id;
-        activeEventId = attachment.event_id;
-        renderAttachmentDetail(attachment);
+      if (!activeEventId) {
+        els.detail.innerHTML = '<div class="empty"><div class="empty-icon" aria-hidden="true"></div><div>Click a message to view details</div></div>';
         return;
       }
       const visibleMessages = filteredMessages();
+      const timelineMessages = activeView === 'timeline' ? visibleTimelineMessages() : [];
+      const directMatches = activeView === 'timeline'
+        ? filteredMessages().filter(message => {
+            const query = currentSearchQuery();
+            return query ? messageQueryText(message).includes(query) : false;
+          })
+        : [];
       const message = activeView === 'timeline'
-        ? (byEvent.get(activeEventId) || visibleMessages[0])
-        : (visibleMessages.find(row => row.event_id === activeEventId) || visibleMessages[0]);
+        ? (
+          timelineMessages.find(row => row.event_id === activeEventId)
+          || directMatches.find(row => row.event_id === activeEventId)
+        )
+        : visibleMessages.find(row => row.event_id === activeEventId);
       if (!message) {
-        els.detail.innerHTML = '<h2>No messages</h2>';
+        clearSelection();
+        els.detail.innerHTML = '<div class="empty"><div class="empty-icon" aria-hidden="true"></div><div>Click a message to view details</div></div>';
         return;
       }
       activeEventId = message.event_id;
-      const attachmentsHtml = (message.attachments || []).map(att => `
+      const threadContextWasOpen = Boolean(
+        els.detail.querySelector('details > summary') &&
+        [...els.detail.querySelectorAll('details > summary')].some(summary => summary.textContent.trim() === 'Thread Context' && summary.parentElement?.open)
+      );
+      const attachments = message.attachments || [];
+      const attachmentsHtml = attachments.map(att => `
         <div class="attachment">
-          <div class="detail-grid">
-            ${detailRow('attachment_id', att.attachment_id)}
-            ${detailRow('exhibit_id', att.exhibit_id)}
-            ${detailRow('linked event_id', att.event_id)}
-            ${detailRow('filename', att.filename)}
-            ${detailRow('MIME type', att.mime_type)}
-            ${detailRow('size', formatBytes(att.size_bytes))}
-            ${detailRow('EXIF UTC', formatDateTime(att.exif_dt_utc))}
-          </div>
           ${attachmentLinks(att)}
-          ${exhibitCoverHtml(att, message)}
           ${attachmentPreviewHtml(att)}
-        </div>`).join('') || '<p>No linked attachments.</p>';
+          ${attachmentMetadataHtml(att, message)}
+        </div>`).join('');
+      const attachmentsSection = attachments.length
+        ? `
+        <details>
+          <summary>Attachments (${attachments.length})</summary>
+          ${attachmentsHtml}
+        </details>`
+        : '<div class="detail-section-empty">No attachments for this message</div>';
 
       els.detail.innerHTML = `
-        <h2>${escapeHtml(message.event_id)} Detail</h2>
-        <p><button id="printDetail" type="button">Print Detail</button></p>
-        ${bundleSummaryHtml()}
-        <div class="detail-grid">
-          ${detailRow('event_id', message.event_id)}
-          ${detailRow('timestamp', formatDateTime(message.event_dt_utc))}
-          ${detailRow('source', message.source)}
-          ${detailRow('direction', message.direction)}
-          ${detailRow('sender', message.sender)}
-          ${detailRow('recipients', (message.recipients || []).join(', '))}
-          ${detailRow('subject', message.subject)}
+        <div class="detail-header">
+          <h2>${escapeHtml(message.event_id)}</h2>
         </div>
-        <h2 style="margin-top:14px;">Body</h2>
-        <div class="body-box">${escapeHtml(message.body_clean || '[no body]')}</div>
-        ${aiEvidenceHtml(message)}
-        <details>
-          <summary>Citation</summary>
-          <textarea id="citationText" readonly rows="3">${escapeHtml(citation(message))}</textarea>
-          <p><button id="copyCitation" type="button">Copy citation</button></p>
-        </details>
-        <h2>Direct Message Attachments</h2>
-        ${attachmentsHtml}
-        ${conversationAttachmentsHtml(message)}
-        <details>
-          <summary>Evidence Integrity</summary>
-          <div class="detail-grid">
-            ${detailRow('event_id', message.event_id)}
-            ${detailRow('content_hash', message.content_hash)}
-            ${detailRow('source file', message.source_file)}
-          </div>
-        </details>
-        <details>
-          <summary>Metadata</summary>
-          <div class="detail-grid">
-            ${detailRow('source_record_id', message.source_record_id)}
-            ${detailRow('thread_key', message.thread_key)}
-            ${detailRow('recipients_json', message.recipients_json)}
-          </div>
-        </details>
-        ${threadContextHtml(message)}
-        ${(message.attachments || []).length ? `
-        <details>
-          <summary>Attachment Metadata</summary>
-          ${(message.attachments || []).map(att => `
-            <div class="attachment">
-              <div class="detail-grid">
-                ${detailRow('attachment_id', att.attachment_id)}
-                ${detailRow('exhibit_id', att.exhibit_id)}
-                ${linkRow('exhibit PDF', att.exhibit_pdf_path, att.exhibit_pdf_path)}
-                ${detailRow('exhibit status', att.exhibit_status)}
-                ${detailRow('exhibit warning', att.exhibit_warning)}
-                ${detailRow('linked event_id', att.event_id)}
-                ${detailRow('source file path', att.source_file)}
-                ${detailRow('saved path', att.saved_path)}
-                ${detailRow('converted path', att.converted_path)}
-                ${detailRow('MIME type', att.mime_type)}
-                ${detailRow('size_bytes', att.size_bytes)}
-                ${detailRow('hash', att.sha256_hash)}
-                ${detailRow('EXIF raw', att.exif_dt_raw)}
-                ${detailRow('EXIF UTC', formatDateTime(att.exif_dt_utc))}
-              </div>
-            </div>`).join('')}
-        </details>` : ''}
+        <div class="message-body-area">${messageBodyHtml(message)}</div>
+        ${attachmentsSection}
+        ${threadContextHtml(message, threadContextWasOpen)}
+        ${recordMetadataHtml(message)}
       `;
-      document.getElementById('copyCitation').addEventListener('click', copyCitation);
-      document.getElementById('printDetail').addEventListener('click', printSelectedDetail);
-      els.detail.querySelectorAll('[data-select-context]').forEach(button => button.addEventListener('click', () => {
-        activeEventId = button.dataset.selectContext;
-        activeView = 'messages';
-        render();
+      els.detail.querySelectorAll('[data-thread-expand-prev]').forEach(button => button.addEventListener('click', event => {
+        event.stopPropagation();
+        const anchor = threadSeparatorAnchorFromButton(button, 'prev');
+        const key = `${button.dataset.threadExpandPrev}:before`;
+        threadContextExpansion.set(key, (threadContextExpansion.get(key) || 0) + TIMELINE_EXPAND_SIZE);
+        renderDetail();
+        restoreThreadAnchor(anchor);
+      }));
+      els.detail.querySelectorAll('[data-thread-expand-next-after]').forEach(button => button.addEventListener('click', event => {
+        event.stopPropagation();
+        const anchor = firstVisibleThreadAnchor();
+        const key = `${button.dataset.threadExpandNextAfter}:after`;
+        threadContextExpansion.set(key, (threadContextExpansion.get(key) || 0) + TIMELINE_EXPAND_SIZE);
+        renderDetail();
+        restoreThreadAnchor(anchor);
       }));
     }
     function render() {
+      const filteredCount = filteredMessages().length;
       els.messagesTab.setAttribute('aria-selected', activeView === 'messages' ? 'true' : 'false');
       els.timelineTab.setAttribute('aria-selected', activeView === 'timeline' ? 'true' : 'false');
-      els.attachmentsTab.setAttribute('aria-selected', activeView === 'attachments' ? 'true' : 'false');
+      els.resultsCount.textContent = `Results: ${filteredCount} ${filteredCount === 1 ? 'message' : 'messages'}`;
+      updatePrintMenuLabels();
       updateFilterToggle();
       renderList();
       renderDetail();
+      updateActiveItems();
     }
-    [els.search, els.source, els.direction, els.attachment, els.start, els.end, els.aiTag].forEach(el => el.addEventListener('input', render));
+    els.search.addEventListener('input', () => {
+      clearSelection();
+      render();
+      els.list.scrollTop = 0;
+    });
+    [els.source, els.direction, els.attachment, els.start, els.end, els.aiTag].forEach(el => el.addEventListener('input', () => {
+      clearSelection();
+      render();
+    }));
     els.toggleFilters.addEventListener('click', () => {
       els.advanced.hidden = !els.advanced.hidden;
       updateFilterToggle();
@@ -2804,15 +3660,16 @@ def render_index(
       els.start.value = '';
       els.end.value = '';
       els.aiTag.value = '';
+      clearSelection();
       render();
+      els.list.scrollTop = 0;
     });
-    els.messagesTab.addEventListener('click', () => { activeView = 'messages'; render(); });
     els.timelineTab.addEventListener('click', () => { activeView = 'timeline'; render(); });
-    els.attachmentsTab.addEventListener('click', () => { activeView = 'attachments'; render(); });
+    els.messagesTab.addEventListener('click', () => { activeView = 'messages'; render(); });
     els.printCurrent.addEventListener('click', () => { els.printMenu.open = false; printSelectedDetail(); });
     els.printResults.addEventListener('click', () => { els.printMenu.open = false; printCurrentResults(); });
     els.printSummary.addEventListener('click', () => { els.printMenu.open = false; printSummaryResults(); });
-    els.printAttachments.addEventListener('click', () => { els.printMenu.open = false; printCurrentAttachments(); });
+    els.printFullPacket.addEventListener('click', () => { els.printMenu.open = false; printFullPacket(); });
     render();
   </script>
 </body>
@@ -2835,8 +3692,7 @@ Primary files:
 - data/bundle_manifest.json: build metadata and source database hash.
 - data/communications.sqlite: copied source database.
 - attachments/: copied original attachment tree plus converted JPG files when present.
-- exhibits/: court-ready derivative PDFs with attachment cover pages.
-- exhibits/attachment_packet.pdf: one binder-ready PDF containing all attachment exhibit PDFs.
+- attachments/<event_id>/pages/*.jpg: rasterized JPEG pages for PDF attachments used by self-contained browser print.
 
 Citation format:
 E-004123 | 2025-05-01T14:30:00Z | SMS | excerpt...
@@ -2845,7 +3701,7 @@ Caveats:
 - The SQLite database and deterministic exports are the source of truth.
 - Missing metadata is shown explicitly where known.
 - Converted JPG files are preferred for viewing HEIC images, but original saved paths are still exposed.
-- Attachment exhibit PDFs prepend a metadata cover page. PDFs and images are embedded when local tooling can read them; unsupported formats receive a cover-only exhibit page.
+- Browser print is self-contained for inline-printable attachments. PDF attachments are rasterized into page images, while unsupported attachment types render as metadata sheets with explicit separate-print notes.
 - No GPS/location columns or location-derived views are included.
 - Optional AI triage output, when present in ai/message_tags.json, is displayed only as a cautious tag layer and does not replace original message text or deterministic metadata.
 
@@ -2877,16 +3733,16 @@ def main() -> None:
     shutil.copytree(attachments_dir, output_dir / "attachments", dirs_exist_ok=True)
 
     message_exports, attachment_exports, timeline_rows = build_exports(messages, attachments)
-    exhibit_summary = build_exhibit_pdfs(output_dir, message_exports, attachment_exports)
+    render_summary = build_attachment_render_assets(output_dir, attachment_exports)
     ai_triage = load_ai_triage(output_dir)
     apply_ai_triage(message_exports, ai_triage)
     integrity = validate(db_path, output_dir, message_exports, attachment_exports, timeline_rows)
-    integrity["checks"]["exhibit_pdfs_generated_without_errors"] = not exhibit_summary.get(
-        "exhibit_generation_warnings"
+    integrity["checks"]["attachment_render_assets_generated_without_errors"] = not render_summary.get(
+        "render_asset_warnings"
     )
-    integrity["details"]["exhibit_generation_warnings"] = exhibit_summary.get("exhibit_generation_warnings", [])
-    integrity["exhibits"] = exhibit_summary
-    if exhibit_summary.get("exhibit_generation_warnings"):
+    integrity["details"]["render_asset_warnings"] = render_summary.get("render_asset_warnings", [])
+    integrity["render_assets"] = render_summary
+    if render_summary.get("render_asset_warnings"):
         integrity["status"] = "review_warnings"
     manifest = build_manifest(
         db_path,
@@ -2895,7 +3751,7 @@ def main() -> None:
         attachment_exports,
         timeline_rows,
         integrity,
-        exhibit_summary,
+        render_summary,
     )
 
     write_json(output_dir / "data" / "messages.json", message_exports)
@@ -2918,7 +3774,7 @@ def main() -> None:
             attachment_exports,
             timeline_rows,
             integrity,
-            exhibit_summary,
+            render_summary,
             ai_triage,
             manifest,
         ),

@@ -71,6 +71,14 @@ RE_QUOTED_REPLY_MARKERS = [
 RE_HTML_TAGS = re.compile(r"<[^>]+>")
 RE_MULTISPACE = re.compile(r"[ \t]+")
 RE_MULTIBLANK = re.compile(r"\n{3,}")
+RE_CID_REFERENCE = re.compile(r"cid:([^\"' >]+)", re.IGNORECASE)
+RE_HTML_QUOTE_MARKERS = [
+    re.compile(r'(?is)<div[^>]+class=["\'][^"\']*gmail_quote[^"\']*["\'][^>]*>'),
+    re.compile(r'(?is)<div[^>]+class=["\'][^"\']*gmail_attr[^"\']*["\'][^>]*>'),
+    re.compile(r"(?is)<blockquote\b"),
+    re.compile(r"(?is)-{2,}\s*Original Message\s*-{2,}"),
+    re.compile(r"(?is)Begin forwarded message:"),
+]
 
 TEXT_MIME_TYPES = {
     "text/plain",
@@ -187,6 +195,64 @@ def strip_quoted_reply(text: str) -> str:
 
     text = RE_MULTIBLANK.sub("\n\n", text).strip()
     return text
+
+def strip_quoted_reply_html(html_text: str) -> str:
+    """
+    Conservative HTML variant of strip_quoted_reply().
+    Keep only the leading fragment before common quoted-thread wrappers.
+    """
+    if not html_text:
+        return ""
+
+    cut_positions = []
+    for rx in RE_HTML_QUOTE_MARKERS:
+        m = rx.search(html_text)
+        if m:
+            cut_positions.append(m.start())
+
+    if cut_positions:
+        return html_text[:min(cut_positions)]
+    return html_text
+
+def normalize_content_id(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return value.strip().strip("<>").lower()
+
+def extract_cid_references(html_text: str) -> set[str]:
+    if not html_text:
+        return set()
+    return {match.group(1).strip().strip("<>").lower() for match in RE_CID_REFERENCE.finditer(html_text)}
+
+def get_email_html_body(msg: Message) -> str:
+    """
+    Collect non-attachment HTML body parts in message order.
+    """
+    if msg.is_multipart():
+        html_parts = []
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if (part.get_content_disposition() or "").lower() == "attachment":
+                continue
+            if (part.get_content_type() or "").lower() != "text/html":
+                continue
+            payload = part.get_payload(decode=True) or b""
+            html_parts.append(decode_bytes_payload(payload, part.get_content_charset()))
+        return "\n\n".join(part.strip() for part in html_parts if part.strip()).strip()
+
+    payload = msg.get_payload(decode=True) or b""
+    if (msg.get_content_type() or "").lower() != "text/html":
+        return ""
+    return decode_bytes_payload(payload, msg.get_content_charset()).strip()
+
+def referenced_inline_content_ids(msg: Message) -> tuple[set[str], set[str]]:
+    html_text = get_email_html_body(msg)
+    if not html_text:
+        return set(), set()
+    all_refs = extract_cid_references(html_text)
+    active_refs = extract_cid_references(strip_quoted_reply_html(html_text))
+    return all_refs, active_refs
 
 def dt_to_iso(dt: datetime) -> str:
     if dt.tzinfo is None:
@@ -384,18 +450,33 @@ def save_email_attachments(msg: Message,
                            attachments_dir: Path,
                            ids: IdGenerator,
                            inserter: Inserter) -> None:
+    referenced_cids, active_cids = referenced_inline_content_ids(msg)
+
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
 
         disposition = (part.get_content_disposition() or "").lower()
         filename = decode_mime_header(part.get_filename())
+        content_id = normalize_content_id(part.get("Content-ID"))
 
         if disposition != "attachment" and not filename:
             continue
 
         payload = part.get_payload(decode=True) or b""
         mime_type = (part.get_content_type() or "").lower()
+
+        # Gmail-style reply chains often carry prior inline CID images forward
+        # inside quoted HTML. Skip those repeated parts unless the current
+        # message body still references them before the quoted history starts.
+        if (
+            content_id
+            and mime_type.startswith("image/")
+            and content_id in referenced_cids
+            and content_id not in active_cids
+        ):
+            continue
+
         attachment_id = ids.next_attachment_id()
 
         ext = ""
